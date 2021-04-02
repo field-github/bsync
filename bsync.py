@@ -261,20 +261,6 @@ def comm_loop(ranks=[]) :
 
 
 
-class MPILoop(object) :
-  sending = [];
-  _inited = False;
-  def empty(self) :
-    return not bool(self.sending);
-  def addsend(self,req) :
-    self.sending.append(req);
-  def loop(self) :
-    l = [i for i in self.sending if MPI_Stat(i.req)];      # list to remove
-    for i in l : self.sending.remove(i);                   # remove sends that are done
-  def __init__(self) :
-    assert not self._inited,"MPILoop is a singleton";
-mpiloop = MPILoop();
-
 class MPImsg(object) :
   def __init__(self,req) :
     self.req = req;
