@@ -55,7 +55,7 @@ class ProcessPool(object) :
   def __getitem__(self,k) :     # return the proc tuple for rank #k
     return self.procs[k];
   def __del__(self) :
-    if not self.forked :
+    if not self.forked :      # only wait for child procs
       for i in self.procs :
         if not i is None : wait();
       print("@@@ done joining procpool");
@@ -190,22 +190,22 @@ def comm_loop(ranks=[]) :
   polling = [];
   with xfer.cv :
     while not xfer._kill :
-      xfer.cv.wait_for(lambda :(xfer.msg or polling or xfer._kill),timeout=TIMEOUT);
+      xfer.cv.wait_for(lambda :(xfer.msg or xfer._kill),timeout=TIMEOUT);
       if xfer._kill :                       # need to drop out now
         xfer.msg = KillMessage();
-      if xfer.msg :
+      must_ack = bool(xfer.msg);      # if there is a message, then we should acknowledge
+      if must_ack :
         typ = type(xfer.msg);
         if typ in [SendMessage,ExecMessage] :
           MPI_Isend(xfer.msg.rank,xfer.msg);
-        elif typ is KillMessage :
-          for i in ranks :
-            print("sending kill mesg",i);
-            MPI_Isend(i,xfer.msg);          # broadcast kill to everyone
-          break;
         elif typ is RecvMessage :
           polling.append(xfer.msg);
+        elif typ is KillMessage :
+          for i in ranks :
+            MPI_Isend(i,xfer.msg);          # broadcast kill to everyone
+          break;
 
-      xfer.msg = None;
+      xfer.msg = None;  # OK, got this message so clear it for next one
 
       if polling :      # only if needed should we enter this
         toremove = [];  # list of connections to drop from the polling list
@@ -217,23 +217,21 @@ def comm_loop(ranks=[]) :
             if not p.notified :
               with p.cv :
                 if type(p) is RecvMessage :
-                  p.msg = MPI_Get(p.req);       # should not block here
+                  p.msg = MPI_Get(p.req);       # should not block here as msg is ready
                 p.notified = True;
                 p.cv.notify_all();
             toremove.append(p);             # don't change polling inside the loop
         for t in toremove :                 # now remove everyone that needs removing
           polling.remove(t);
 
-      mpiloop.loop();
-    
+      mpiloop.loop();     # MPI event loop
+
       # acknowledge processing here
-      if not xfer.ack is None :
+      if must_ack and not xfer.ack is None :
         with xfer.ack :
           xfer.ack.notify_all();
 
-    print("in comm loop cleaning up ",mpiloop.empty());
     while not mpiloop.empty() : mpiloop.loop();     # allow sending buffer to empty out
-    print("leaving comm loop cleaning up ",mpiloop.empty());
 
 
 
@@ -283,7 +281,6 @@ class ProcException(Exception) :
 def exec_loop(rank=ROOT_RANK,tag=DEFAULT_TAG) :
   while True :
     msg = myrecv(rank,tag);
-    print("got message ",msg);
     if type(msg) is KillMessage :
       break;
     if type(msg) is ExecMessage :
@@ -294,14 +291,14 @@ def exec_loop(rank=ROOT_RANK,tag=DEFAULT_TAG) :
         retval = ProcException(e);
       mysend(rank,retval,tag);
       del retval,func;
-  print("@@@ leaving exec_loop");
 
 
 def myfunc(x) :
   print("@ myfunc got",x);
+#  raise Exception("hell world!");
   return x+2;
 
-procpool = ProcessPool(10);
+procpool = ProcessPool(5);
 if procpool.forked :
   exec_loop();
   del procpool;
@@ -309,26 +306,38 @@ if procpool.forked :
 else :
   th = Thread(target=comm_loop,args=(procpool.get_ranks(),));
   th.start();
-  sleep(0.5);
+
+  t = [RecvMessage(n) for n in [3,2,1]];
+  for n in t :
+    with xfer.cv :
+      xfer.ack.acquire();
+      xfer.msg = n;
+      xfer.cv.notify();
+    xfer.ack.wait_for(lambda : (xfer.msg is None));
+    xfer.ack.release();
 
   for n in [1,2,3] :
     with xfer.cv :
       xfer.msg = ExecMessage(n,myfunc,3+n);
       xfer.ack.acquire();
       xfer.cv.notify();
-    xfer.ack.wait_for(lambda : xfer.msg is None);
+    xfer.ack.wait_for(lambda : (xfer.msg is None));
     xfer.ack.release();
 
+  for i in t :
+    while not i.notified : sleep(0.1);
+    print("@ got it !! ",i.req.__dict__);
 
-  for n in [3,2,1] :
-    t = RecvMessage(n);
-    xfer.cv.acquire();
-    xfer.msg = t;
-    with t.cv :
-      xfer.cv.release();
-      while not t.notified : t.cv.wait();
-      print("@ got out!!!! ",t.req.__dict__);
-   
+  if False :
+    for n in [3,2,1] :
+      t = RecvMessage(n);
+      xfer.cv.acquire();
+      xfer.msg = t;
+      with t.cv :
+        xfer.cv.release();
+        while not t.notified : t.cv.wait();
+        print("@ got out!!!! ",t.req.__dict__);
+     
   if False :
     with xfer.cv :
       xfer.msg = ExecMessage(2,myfunc,13);
