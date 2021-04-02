@@ -110,7 +110,16 @@ def remove_hdr(msg) :
 
 def myisend(rank,msg,tag=DEFAULT_TAG) :
   k,pid,rm,wm = procpool[rank];
-  msg = dumps(msg,protocol=2);
+  # NOTE: Condition variables are not pickleable and so we have to excise
+  #  them from the object before pickling them to send down the line
+  if not hasattr(msg,'cv') :
+    msg = dumps(msg,protocol=2);
+  else :
+    cv = msg.cv;
+    msg.cv = None;
+    tmp = dumps(msg,protocol=2);
+    msg.cv = cv;
+    msg = tmp;
   msg = add_hdr(msg);
   n = write(wm,msg);
   assert(n==len(msg));    # TODO must not break apart message for now
@@ -151,11 +160,11 @@ class Message(object) :
     self.data = data;
     self.tag = tag;
     self.req = None;
+    self.notified = False;
+    self.cv = Condition();      # NOTE: can't be pickled
 
 class RecvMessage(Message) :
   def __init__(self,rank,tag=DEFAULT_TAG) :
-    self.notified = False;
-    self.cv = Condition();
     super(RecvMessage,self).__init__(rank,tag=tag);
 
 class SendMessage(Message) :
@@ -188,6 +197,7 @@ class KillMessage(Message) :
 
 def comm_loop(ranks=[]) :
   polling = [];
+  sending = [];
   with xfer.cv :
     while not xfer._kill :
       xfer.cv.wait_for(lambda :(xfer.msg or xfer._kill),timeout=TIMEOUT);
@@ -196,12 +206,17 @@ def comm_loop(ranks=[]) :
       must_ack = bool(xfer.msg);      # if there is a message, then we should acknowledge
       if must_ack :
         typ = type(xfer.msg);
+        # NOTE: we're going to treat sending and receiving as different
+        #  queues even though it seems like it might be possible to
+        #  reuese code for both. In the future, I fear that the divergence
+        #  between the two might increase and so this allows for that.
         if typ in [SendMessage,ExecMessage] :
-          MPI_Isend(xfer.msg.rank,xfer.msg);
+          sending.append(xfer.msg);
         elif typ is RecvMessage :
           polling.append(xfer.msg);
         elif typ is KillMessage :
           for i in ranks :
+            # NOTE: would it be better to queue this up in sending?
             MPI_Isend(i,xfer.msg);          # broadcast kill to everyone
           break;
 
@@ -224,14 +239,25 @@ def comm_loop(ranks=[]) :
         for t in toremove :                 # now remove everyone that needs removing
           polling.remove(t);
 
-      mpiloop.loop();     # MPI event loop
+      if sending :
+        toremove = [];
+        for s in sending :
+          if s.req is None :
+            s.req = MPI_Isend(s.rank,s,s.tag);
+          s.stat = MPI_Stat(s.req);
+          if s.stat :
+            if not s.notified :
+              with s.cv :
+                s.notified = True;
+                s.cv.notify_all();
+            toremove.append(s);
+        for t in toremove :
+          sending.remove(t);
 
       # acknowledge processing here
       if must_ack and not xfer.ack is None :
         with xfer.ack :
           xfer.ack.notify_all();
-
-    while not mpiloop.empty() : mpiloop.loop();     # allow sending buffer to empty out
 
 
 
@@ -254,9 +280,7 @@ class MPImsg(object) :
     self.req = req;
 
 def MPI_Isend(rank,msg,tag=DEFAULT_TAG) :
-  req = myisend(rank,msg,tag);
-  mpiloop.addsend(MPImsg(req));
-  mpiloop.loop();
+  return myisend(rank,msg,tag);
 
 def MPI_Irecv(rank,tag=DEFAULT_TAG) :
   req = myirecv(rank,tag);
@@ -298,7 +322,7 @@ def myfunc(x) :
 #  raise Exception("hell world!");
   return x+2;
 
-procpool = ProcessPool(5);
+procpool = ProcessPool(3);
 if procpool.forked :
   exec_loop();
   del procpool;
@@ -307,7 +331,15 @@ else :
   th = Thread(target=comm_loop,args=(procpool.get_ranks(),));
   th.start();
 
-  t = [RecvMessage(n) for n in [3,2,1]];
+  for n in [1,2] :
+    with xfer.cv :
+      xfer.msg = ExecMessage(n,myfunc,3+n);
+      xfer.ack.acquire();
+      xfer.cv.notify();
+    xfer.ack.wait_for(lambda : (xfer.msg is None));
+    xfer.ack.release();
+  
+  t = [RecvMessage(n) for n in [1,2]];
   for n in t :
     with xfer.cv :
       xfer.ack.acquire();
@@ -316,16 +348,9 @@ else :
     xfer.ack.wait_for(lambda : (xfer.msg is None));
     xfer.ack.release();
 
-  for n in [1,2,3] :
-    with xfer.cv :
-      xfer.msg = ExecMessage(n,myfunc,3+n);
-      xfer.ack.acquire();
-      xfer.cv.notify();
-    xfer.ack.wait_for(lambda : (xfer.msg is None));
-    xfer.ack.release();
-
   for i in t :
-    while not i.notified : sleep(0.1);
+    while not i.notified :
+      sleep(TIMEOUT);
     print("@ got it !! ",i.req.__dict__);
 
   if False :
