@@ -39,16 +39,23 @@ class ProcessPool(object) :
         self.procs.append((i,pid,rm,wm));
         self.unused.append(i);
     self.lock = Lock();       # no need to fork that lock over and over
+    self.ack = Condition();   # acknowledge new proc available
   def get_ranks(self) :
     return [_[0] for _ in self.procs if _];      # list of ranks
   def get_avail_rank(self) :
+    while True :
+      n = self.nonblock_get_avail_rank();
+      if not n is None : return n;
+  def nonblock_get_avail_rank(self) :
     with self.lock :
-      while not self.unused : sleep(0);
+      if not self.unused : return None;
       self.used.append(self.unused.pop(0));
   def return_avail_rank(self,p) :
     with self.lock :
       self.unused.append(p);
       self.used.remove(p);
+    with self.ack :
+      self.ack.notify_all();
   def avail(self) :
     with self.lock :
       return self.count;
@@ -144,10 +151,11 @@ class Xfer :
   _inited = False;
   _kill = False;
   msg = None;
+  cv = Condition();
+  ack = Condition();
   def __init__(self) :
     assert not self._inited,"Xfer is a singleton";
-    self.cv = Condition();
-    self.ack = Condition();
+    Xfer._inited = True;
 xfer = Xfer();
 
 
@@ -302,6 +310,63 @@ def exec_loop(rank=ROOT_RANK,tag=DEFAULT_TAG) :
       mysend(rank,retval,tag);
       del retval,func;
 
+class Loader(object) :
+  _loading = [];
+  lock = Lock();          # lock for modifying loading list
+  _inited = False;
+  _kill = False;
+
+  def __init__(self) :
+    assert not Loader._inited,"Loader is a singleton";
+    Loader._inited = True;
+
+  def load(self,*v) :
+    with self.lock :
+      _loading.append(v);
+
+  def kill(self) :
+    Loader._kill = True;
+
+  def loading_loop(self) :
+    while not Loader._kill :
+      with procpool.ack :
+        # NOTE: drops out at timeout even with none available
+        #       This is needed in case of missed notify at startup, etc.
+        procpool.ack.wait_for(lambda : (Loader._loading and procpool.avail()),timeout=0.1)
+
+      if Loader._kill : break;
+
+      nmax = procpool.avail();
+      if not nmax : continue;       # nobody is free now
+
+      toremove = [];
+      with Loader.lock :
+        for i in Loader._loading :
+          n = procpool.nonblock_get_avail_rank();
+          if n is None : break;         # no ranks available
+          # load the command into the message queue
+          with xfer.cv :
+            xfer.ack.acquire();
+            xfer.msg = ExecMessage(n,*i);
+            xfer.cv.notify();
+          xfer.ack.wait_for(lambda : (xfer.msg is None));
+          # load the receiver of the return response into the message queue
+          with xfer.cv :
+            xfer.ack.acquire();
+            xfer.msg = RecvMessage(n);
+            xfer.cv.notify();
+          xfer.ack.wait_for(lambda : (xfer.msg is None));
+
+          # keep track of all the tasks that have just been handled above
+          toremove.append(i);
+
+        # and remove all the processed tasks
+        for t in toremove : Loader._loading.remove(t);
+
+
+loader = Loader();
+
+
 
 def myfunc(x) :
   print("@ myfunc got",x);
@@ -316,6 +381,8 @@ if procpool.forked :
 else :
   th = Thread(target=comm_loop,args=(procpool.get_ranks(),));
   th.start();
+  thload = Thread(target=loader.loading_loop);
+  thload.start();
 
   for n in [1,2] :
     with xfer.cv :
@@ -361,8 +428,10 @@ else :
       while not t.notified : t.cv.wait();
       print("@ got out!!!! ",t.req.__dict__);
 
+  loader.kill();
   with xfer.cv :
     xfer.msg = KillMessage();
   th.join();
+  thload.join();
   del procpool;
 
