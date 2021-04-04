@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 
-from sys import *
-from pickle import *
-from threading import *
+#from sys import *
+from copy import copy
+from pickle import dumps,loads,HIGHEST_PROTOCOL
+from threading import Thread,Condition,Lock,RLock
 from os import open,close,write,read,O_NONBLOCK,pipe,pipe2,fork,getpid,wait
 from time import sleep
 from select import select
 from abc import ABC
 from struct import pack,unpack
 
-PICKLE_PROTO = 2;
+PICKLE_PROTO = 2;     # pickle protocol to use
 TIMEOUT = 0.001;
 DEFAULT_TAG = -1;
 ROOT_RANK = 0;
-MAXREAD = 1<<24;
+MAXREAD = 1;
+MAXMSGLEN = 1<<20;
 
 # ========================================================================
 
@@ -71,10 +73,10 @@ class ProcessPool(object) :
 
 
 class Request(ABC) :
-  def __init__(self,k) :
+  def __init__(self,k,msg=None,ready=False) :
     self.id = k;
-    self.msg = None;
-    self.ready = False;
+    self.msg = msg;
+    self.ready = ready;
 class SendRequest(Request) : pass;
 class RecvRequest(Request) : pass;
 
@@ -117,24 +119,24 @@ def remove_hdr(msg) :
   msg = msg[8:];
   return hdr,msg;
 
+class RawMessage(object) :
+  def __init__(self,data) : self.raw = data;
+
 def myisend(rank,msg,tag=DEFAULT_TAG) :
   k,pid,rm,wm = procpool[rank];
   # NOTE: Condition variables are not pickleable and so we have to excise
   #  them from the object before pickling them to send down the line
-  if not hasattr(msg,'cv') :
-    msg = dumps(msg,protocol=2);
-  else :
-    cv = msg.cv;
-    msg.cv = None;
-    tmp = dumps(msg,protocol=2);
-    msg.cv = cv;
-    msg = tmp;
-  msg = add_hdr(msg);
-  n = write(wm,msg);
-  assert(n==len(msg));    # TODO must not break apart message for now
-  return SendRequest(k);
+  if not isinstance(msg,Message) :
+    msg = RawMessage(add_hdr(dumps(msg,protocol=PICKLE_PROTO)));
+  elif msg.raw is None :
+    msg.raw = add_hdr(dumps(msg,protocol=PICKLE_PROTO));
+  n = write(wm,msg.raw[:MAXMSGLEN]);
+  msg.raw = msg.raw[n:];
+  return SendRequest(k,ready=not msg.raw);
 
-mysend = myisend;     # ignore blocking send for now
+def mysend(rank,msg,tag=DEFAULT_TAG) :
+  while not myisend(rank,msg,tag).ready : sleep(0);
+  return True;
 
 def myirecv(rank,tag=DEFAULT_TAG) :
   k,pid,rm,wm = procpool[rank];
@@ -161,35 +163,25 @@ class Xfer :
 xfer = Xfer();
 
 
-class Rank(int) : pass;
-class Tag(int) : pass;
-
 class Message(object) :
-  def __init__(self,rank,data=None,tag=DEFAULT_TAG) :
+  def __init__(self,rank,tag=DEFAULT_TAG) :
     self.rank = rank;
-    self.data = data;
     self.tag = tag;
     self.req = None;
+    self.raw = None;
     self.notified = False;
     self.cv = Condition();      # NOTE: can't be pickled
+  def __getstate__(self) :      # remove cv property to allow pickling
+    d = copy(self.__dict__);
+    d['cv'] = None;
+    return d;
 
 class RecvMessage(Message) :
   def __init__(self,rank,tag=DEFAULT_TAG) :
     super(RecvMessage,self).__init__(rank,tag=tag);
 
 class SendMessage(Message) :
-  pickleable = set();                      # list of things known to be pickleable
-  not_pickleable = set();                  # list of things known not to be pickleable
   def __init__(self,rank,msg,tag=DEFAULT_TAG) :
-    if not msg[0] in self.pickleable :
-      try :
-        if msg[0] in self.not_pickleable : raise Exception();
-        dumps(msg[0],protocol=2);       # attempt to pickle the function
-        self.pickleable.add(msg[0]);
-      except :
-        # give it a string name if not pickleable and add to nonpickleable set
-        self.not_pickleable.add(msg[0]);
-        msg = ("__main__.%s.__name__" % msg[0].__name__,)+msg[1:];
     self.msg = msg;
     super(SendMessage,self).__init__(rank,tag=tag);
   @property
@@ -197,13 +189,22 @@ class SendMessage(Message) :
   @property
   def args(self) : return self.msg[1:];
 
+class ReturnMessage(Message) :
+  def __init__(self,rank,msg,tag=DEFAULT_TAG) :
+    self.msg = msg;
+    super(ReturnMessage,self).__init__(rank,tag);
+
 class ExecMessage(SendMessage) :
   def __init__(self,rank,f,*args,tag=DEFAULT_TAG) :
+    try :
+      dumps(f,protocol=PICKLE_PROTO);
+    except :
+      f = "__main__.%s.__name__" % f.__name__;
     super(ExecMessage,self).__init__(rank,(f,)+args,tag);
 
 class KillMessage(Message) :
   def __init__(self) :
-    super(KillMessage,self).__init__(self,ROOT_RANK);
+    super(KillMessage,self).__init__(ROOT_RANK);
 
 def comm_loop(ranks=[]) :
   polling = [];
@@ -226,8 +227,9 @@ def comm_loop(ranks=[]) :
           polling.append(xfer.msg);
         elif typ is KillMessage :
           for i in ranks :
-            # NOTE: would it be better to queue this up in sending?
-            MPI_Isend(i,xfer.msg);          # broadcast kill to everyone
+            # NOTE: perhaps would be better to queue this up in sending list?
+            x = copy(xfer.msg);
+            MPI_send(i,x,x.tag);          # broadcast kill to everyone
           break;
 
       xfer.msg = None;  # OK, got this message so clear it for next one
@@ -255,6 +257,7 @@ def comm_loop(ranks=[]) :
         for s in sending :
           if s.req is None :
             s.req = MPI_Isend(s.rank,s,s.tag);
+            if not s.req.ready : continue;
           s.stat = MPI_Stat(s.req);
           if s.stat :
             if not s.notified :
@@ -279,6 +282,9 @@ class MPImsg(object) :
 def MPI_Isend(rank,msg,tag=DEFAULT_TAG) :
   return myisend(rank,msg,tag);
 
+def MPI_send(rank,msg,tag=DEFAULT_TAG) :
+  return mysend(rank,msg,tag);
+
 def MPI_Irecv(rank,tag=DEFAULT_TAG) :
   req = myirecv(rank,tag);
   return req;
@@ -293,6 +299,8 @@ def MPI_Get(req) :
 
 
 class ProcException(Exception) :
+  """ special exception that contains another exception for sending
+    across the MPI connection """
   def __init__(self,e) :
     self.exc = e;
 
@@ -309,8 +317,8 @@ def exec_loop(rank=ROOT_RANK,tag=DEFAULT_TAG) :
       try :
         retval = func(*msg.args);
       except Exception as e :
-        retval = ProcException(e);
-      mysend(rank,retval,tag);
+        retval = ProcException(e);      # send an encapsulated exception
+      mysend(rank,ReturnMessage(rank,retval,tag),tag);
       del retval,func;
 
 class MessageHandle(object) :
@@ -318,11 +326,13 @@ class MessageHandle(object) :
   def attach(self,msg) : self.msg = msg;
   def ready(self) :
     return self.msg.notified if hasattr(self,'msg') else False;
-  def get(self) :
+  def get(self,reraise=True) :
     while not hasattr(self,'msg') : sleep(0);
     with self.msg.cv :
       self.msg.cv.wait_for(lambda : self.msg.notified);
-    return self.msg.msg;
+    if reraise and isinstance(self.msg.msg.msg,ProcException) :
+      raise self.msg.msg.msg.exc;
+    return self.msg.msg.msg;
   def queued(self) :
     return hasattr(self.msg);
 
@@ -405,63 +415,15 @@ else :
   thload = Thread(target=loader.loading_loop);
   thload.start();
 
-  m1 = loader.load(myfunc,4);
-  m2 = loader.load(myfunc,5);
+  if True :
+    m1 = loader.load(myfunc,4);
+    m2 = loader.load(myfunc,5);
 
-  print("@@ m1 ",m1.get(),m2.get());
+#    while not m1.ready() or not m2.ready() : sleep(0.01);
+    print("@@ m1 ",m1.get(),m2.get());
 
-  while not m1.ready() or not m2.ready() : sleep(0.01);
-  print("@@ m1 ",m1.msg.msg);
-  print("@@ m2 ",m2.msg.msg);
-
-  ms = [loader.load(myfunc,i) for i in range(10)];
-  for i in ms : print(i,i.get());
-
-  if False :
-    for n in [1,2] :
-      with xfer.cv :
-        xfer.msg = ExecMessage(n,myfunc,3+n);
-        xfer.ack.acquire();
-        xfer.cv.notify();
-      xfer.ack.wait_for(lambda : (xfer.msg is None));
-      xfer.ack.release();
-    
-    t = [RecvMessage(n) for n in [1,2]];
-    for n in t :
-      with xfer.cv :
-        xfer.ack.acquire();
-        xfer.msg = n;
-        xfer.cv.notify();
-      xfer.ack.wait_for(lambda : (xfer.msg is None));
-      xfer.ack.release();
-
-  if False :
-    for i in t :
-      while not i.notified :
-        sleep(TIMEOUT);
-      print("@ got it !! ",i.req.__dict__);
-
-  if False :
-    for n in [3,2,1] :
-      t = RecvMessage(n);
-      xfer.cv.acquire();
-      xfer.msg = t;
-      with t.cv :
-        xfer.cv.release();
-        while not t.notified : t.cv.wait();
-        print("@ got out!!!! ",t.req.__dict__);
-     
-  if False :
-    with xfer.cv :
-      xfer.msg = ExecMessage(2,myfunc,13);
-    sleep(0.1);
-    t = RecvMessage(2);
-    xfer.cv.acquire();
-    xfer.msg = t;
-    with t.cv :
-      xfer.cv.release();
-      while not t.notified : t.cv.wait();
-      print("@ got out!!!! ",t.req.__dict__);
+    ms = [loader.load(myfunc,i) for i in range(10)];
+    for i in ms : print(i,i.get());
 
   loader.kill();
   with xfer.cv :
