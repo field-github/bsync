@@ -9,13 +9,13 @@ from time import sleep
 from select import select
 from abc import ABC
 from struct import pack,unpack
+from queue import PriorityQueue
 
 PICKLE_PROTO = 2;     # pickle protocol to use
 TIMEOUT = 0.001;
 DEFAULT_TAG = -1;
-ROOT_RANK = 0;
-MAXREAD = 1;
-MAXMSGLEN = 1<<20;
+ROOT_RANK = 0;        # the controller rank
+MAXMSGLEN = 1000; #1<<20;
 
 # ========================================================================
 
@@ -96,7 +96,7 @@ def mystat(req) :
   k,pid,rd,wr = procpool[req.id]
   r_rdy,w_rdy,e_rdy = select([FakeFile(rd),],[],[],0.);
   if r_rdy :
-    data = read(rd,MAXREAD);
+    data = read(rd,MAXMSGLEN);
     if req.msg is None :
       req.msg = data;
     else :
@@ -255,7 +255,7 @@ def comm_loop(ranks=[]) :
       if sending :
         toremove = [];
         for s in sending :
-          if s.req is None :
+          if s.req is None or not s.req.ready:
             s.req = MPI_Isend(s.rank,s,s.tag);
             if not s.req.ready : continue;
           s.stat = MPI_Stat(s.req);
@@ -322,7 +322,9 @@ def exec_loop(rank=ROOT_RANK,tag=DEFAULT_TAG) :
       del retval,func;
 
 class MessageHandle(object) :
-  def __init__(self,v) : self.params = v;
+  def __init__(self,v,priority=0) :
+    self.params = v;
+    self.priority = priority;
   def attach(self,msg) : self.msg = msg;
   def ready(self) :
     return self.msg.notified if hasattr(self,'msg') else False;
@@ -335,9 +337,11 @@ class MessageHandle(object) :
     return self.msg.msg.msg;
   def queued(self) :
     return hasattr(self.msg);
+  def __lt__(self,other) :    # rank based on priority level
+    return self.priority < other.priority;
 
 class Loader(object) :
-  _loading = [];
+  _loading = PriorityQueue();
   lock = Lock();          # lock for modifying loading list
   _inited = False;
   _kill = False;
@@ -346,11 +350,11 @@ class Loader(object) :
     assert not Loader._inited,"Loader is a singleton";
     Loader._inited = True;
 
-  def load(self,*v) :     # returns message handle to the job
+  def load(self,*v,priority=0) :     # returns message handle to the job
     with procpool.ack :
       with self.lock :
-        m = MessageHandle(v);
-        Loader._loading.append(m);
+        m = MessageHandle(v,priority=priority);
+        Loader._loading.put(m);
       procpool.ack.notify_all();    # notify loadloop of new stuff
     return m;
 
@@ -362,7 +366,7 @@ class Loader(object) :
       with procpool.ack :
         # NOTE: drops out at timeout even with none available
         #       This is needed in case of missed notify at startup, etc.
-        procpool.ack.wait_for(lambda : (Loader._loading and procpool.avail()),timeout=0.1)
+        procpool.ack.wait_for(lambda : (not Loader._loading.empty() and procpool.avail()),timeout=0.1)
 
       if Loader._kill : break;
 
@@ -371,9 +375,10 @@ class Loader(object) :
 
       toremove = [];
       with Loader.lock :
-        for i in Loader._loading :
+        while not Loader._loading.empty() :
           n = procpool.nonblock_get_avail_rank();
           if n is None : break;         # no ranks available
+          i = Loader._loading.get();      # will not block
           # load the command into the message queue
           with xfer.cv :
             xfer.ack.acquire();
@@ -387,12 +392,6 @@ class Loader(object) :
             i.attach(xfer.msg);                  # attach message to MessageHandle
             xfer.cv.notify();
           xfer.ack.wait_for(lambda : (xfer.msg is None));
-
-          # keep track of all the tasks that have just been handled above
-          toremove.append(i);
-
-        # and remove all the processed tasks
-        for t in toremove : Loader._loading.remove(t);
 
 
 loader = Loader();
