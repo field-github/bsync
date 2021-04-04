@@ -49,7 +49,9 @@ class ProcessPool(object) :
   def nonblock_get_avail_rank(self) :
     with self.lock :
       if not self.unused : return None;
-      self.used.append(self.unused.pop(0));
+      rank = self.unused.pop(0);
+      self.used.append(rank);
+      return rank;
   def return_avail_rank(self,p) :
     with self.lock :
       self.unused.append(p);
@@ -242,6 +244,7 @@ def comm_loop(ranks=[]) :
                 if type(p) is RecvMessage :
                   p.msg = MPI_Get(p.req);       # should not block here as msg is ready
                 p.notified = True;
+                procpool.return_avail_rank(p.rank);
                 p.cv.notify_all();
             toremove.append(p);             # don't change polling inside the loop
         for t in toremove :                 # now remove everyone that needs removing
@@ -310,6 +313,19 @@ def exec_loop(rank=ROOT_RANK,tag=DEFAULT_TAG) :
       mysend(rank,retval,tag);
       del retval,func;
 
+class MessageHandle(object) :
+  def __init__(self,v) : self.params = v;
+  def attach(self,msg) : self.msg = msg;
+  def ready(self) :
+    return self.msg.notified if hasattr(self,'msg') else False;
+  def get(self) :
+    while not hasattr(self,'msg') : sleep(0);
+    with self.msg.cv :
+      self.msg.cv.wait_for(lambda : self.msg.notified);
+    return self.msg.msg;
+  def queued(self) :
+    return hasattr(self.msg);
+
 class Loader(object) :
   _loading = [];
   lock = Lock();          # lock for modifying loading list
@@ -320,9 +336,13 @@ class Loader(object) :
     assert not Loader._inited,"Loader is a singleton";
     Loader._inited = True;
 
-  def load(self,*v) :
-    with self.lock :
-      _loading.append(v);
+  def load(self,*v) :     # returns message handle to the job
+    with procpool.ack :
+      with self.lock :
+        m = MessageHandle(v);
+        Loader._loading.append(m);
+      procpool.ack.notify_all();    # notify loadloop of new stuff
+    return m;
 
   def kill(self) :
     Loader._kill = True;
@@ -347,13 +367,14 @@ class Loader(object) :
           # load the command into the message queue
           with xfer.cv :
             xfer.ack.acquire();
-            xfer.msg = ExecMessage(n,*i);
+            xfer.msg = ExecMessage(n,*i.params);
             xfer.cv.notify();
           xfer.ack.wait_for(lambda : (xfer.msg is None));
           # load the receiver of the return response into the message queue
           with xfer.cv :
             xfer.ack.acquire();
             xfer.msg = RecvMessage(n);
+            i.attach(xfer.msg);                  # attach message to MessageHandle
             xfer.cv.notify();
           xfer.ack.wait_for(lambda : (xfer.msg is None));
 
@@ -384,27 +405,41 @@ else :
   thload = Thread(target=loader.loading_loop);
   thload.start();
 
-  for n in [1,2] :
-    with xfer.cv :
-      xfer.msg = ExecMessage(n,myfunc,3+n);
-      xfer.ack.acquire();
-      xfer.cv.notify();
-    xfer.ack.wait_for(lambda : (xfer.msg is None));
-    xfer.ack.release();
-  
-  t = [RecvMessage(n) for n in [1,2]];
-  for n in t :
-    with xfer.cv :
-      xfer.ack.acquire();
-      xfer.msg = n;
-      xfer.cv.notify();
-    xfer.ack.wait_for(lambda : (xfer.msg is None));
-    xfer.ack.release();
+  m1 = loader.load(myfunc,4);
+  m2 = loader.load(myfunc,5);
 
-  for i in t :
-    while not i.notified :
-      sleep(TIMEOUT);
-    print("@ got it !! ",i.req.__dict__);
+  print("@@ m1 ",m1.get(),m2.get());
+
+  while not m1.ready() or not m2.ready() : sleep(0.01);
+  print("@@ m1 ",m1.msg.msg);
+  print("@@ m2 ",m2.msg.msg);
+
+  ms = [loader.load(myfunc,i) for i in range(10)];
+  for i in ms : print(i,i.get());
+
+  if False :
+    for n in [1,2] :
+      with xfer.cv :
+        xfer.msg = ExecMessage(n,myfunc,3+n);
+        xfer.ack.acquire();
+        xfer.cv.notify();
+      xfer.ack.wait_for(lambda : (xfer.msg is None));
+      xfer.ack.release();
+    
+    t = [RecvMessage(n) for n in [1,2]];
+    for n in t :
+      with xfer.cv :
+        xfer.ack.acquire();
+        xfer.msg = n;
+        xfer.cv.notify();
+      xfer.ack.wait_for(lambda : (xfer.msg is None));
+      xfer.ack.release();
+
+  if False :
+    for i in t :
+      while not i.notified :
+        sleep(TIMEOUT);
+      print("@ got it !! ",i.req.__dict__);
 
   if False :
     for n in [3,2,1] :
