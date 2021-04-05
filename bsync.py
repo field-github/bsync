@@ -10,6 +10,7 @@ from select import select
 from abc import ABC
 from struct import pack,unpack
 from queue import PriorityQueue
+from signal import signal,alarm,SIGALRM
 
 PICKLE_PROTO = 2;     # pickle protocol to use
 TIMEOUT = 0.001;
@@ -195,11 +196,12 @@ class ReturnMessage(Message) :
     super(ReturnMessage,self).__init__(rank,tag);
 
 class ExecMessage(SendMessage) :
-  def __init__(self,rank,f,*args,tag=DEFAULT_TAG) :
+  def __init__(self,rank,f,*args,tag=DEFAULT_TAG,timeout=None) :
     try :
       dumps(f,protocol=PICKLE_PROTO);
     except :
       f = "__main__.%s.__name__" % f.__name__;
+    self.timeout = timeout;
     super(ExecMessage,self).__init__(rank,(f,)+args,tag);
 
 class KillMessage(Message) :
@@ -304,27 +306,45 @@ class ProcException(Exception) :
   def __init__(self,e) :
     self.exc = e;
 
+def sighandler(signum,frame) :      # sigalrm handler raises exception on timeout
+  raise TimeoutError("Timeout in remote exec process");
+
 # this is the execution loop on the remote end. All it does is receive commands
 # and then executes them in a blocking fashion. If it receives a KillMessage,
-# then drop out of the loop
+# then drop out of the loop. Timeouts are 
 def exec_loop(rank=ROOT_RANK,tag=DEFAULT_TAG) :
+  signal(SIGALRM,sighandler);       # arrange to capture SIGALRM
   while True :
     msg = myrecv(rank,tag);
     if type(msg) is KillMessage :
       break;
     if type(msg) is ExecMessage :
       func = msg.func if not isinstance(msg.func,str) else eval(msg.func);
+      timeout = getattr(msg,'timeout',None);
       try :
-        retval = func(*msg.args);
-      except Exception as e :
-        retval = ProcException(e);      # send an encapsulated exception
+        try :
+          if timeout : alarm(timeout);
+          retval = func(*msg.args);
+        except Exception as e :
+          retval = ProcException(e);      # send an encapsulated exception
+      # there is an unfortunate race here. It is possible for the exec'ed
+      # function to raise an exception and then during the handling of that
+      # exception for the timeout to occur which would then raise and clobber
+      # the exec_loop for this rank with possibly downstream fatal and/or
+      # unpredictable results. So, we double wrap the called function.
+      except :
+        # So, this should really be a very, very rare off-normal event.
+        retval = Exception("Alarm timeout race in exec_loop");
+      finally :
+        if timeout : alarm(0);
       mysend(rank,ReturnMessage(rank,retval,tag),tag);
       del retval,func;
 
 class MessageHandle(object) :
-  def __init__(self,v,priority=0) :
-    self.params = v;
-    self.priority = priority;
+  def __init__(self,v,priority=0,timeout=None) :
+    self.params = v;            # parameters for exec call (f,arg1,arg2,...)
+    self.timeout=timeout;       # timeout for remote process (not for sending)
+    self.priority = priority;   # priority of this task (lower number is *more* priority
   def attach(self,msg) : self.msg = msg;
   def ready(self) :
     return self.msg.notified if hasattr(self,'msg') else False;
@@ -350,10 +370,10 @@ class Loader(object) :
     assert not Loader._inited,"Loader is a singleton";
     Loader._inited = True;
 
-  def load(self,*v,priority=0) :     # returns message handle to the job
+  def load(self,*v,priority=0,timeout=None) :     # returns message handle to the job
     with procpool.ack :
       with self.lock :
-        m = MessageHandle(v,priority=priority);
+        m = MessageHandle(v,priority=priority,timeout=timeout);
         Loader._loading.put(m);
       procpool.ack.notify_all();    # notify loadloop of new stuff
     return m;
@@ -366,7 +386,9 @@ class Loader(object) :
       with procpool.ack :
         # NOTE: drops out at timeout even with none available
         #       This is needed in case of missed notify at startup, etc.
-        procpool.ack.wait_for(lambda : (not Loader._loading.empty() and procpool.avail()),timeout=0.1)
+        procpool.ack.wait_for(\
+            lambda : (not Loader._loading.empty() \
+                        and procpool.avail()),timeout=0.1)
 
       if Loader._kill : break;
 
@@ -382,7 +404,7 @@ class Loader(object) :
           # load the command into the message queue
           with xfer.cv :
             xfer.ack.acquire();
-            xfer.msg = ExecMessage(n,*i.params);
+            xfer.msg = ExecMessage(n,*i.params,timeout=i.timeout);
             xfer.cv.notify();
           xfer.ack.wait_for(lambda : (xfer.msg is None));
           # load the receiver of the return response into the message queue
@@ -415,7 +437,7 @@ else :
   thload.start();
 
   if True :
-    m1 = loader.load(myfunc,4);
+    m1 = loader.load(myfunc,4,timeout=1);
     m2 = loader.load(myfunc,5);
 
 #    while not m1.ready() or not m2.ready() : sleep(0.01);
