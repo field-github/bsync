@@ -70,11 +70,14 @@ class ProcessPool(object) :
       return self.count;
   def __getitem__(self,k) :     # return the proc tuple for rank #k
     return self.procs[k];
-  def __del__(self) :
+  def deleter(self) :
     if not self.forked :      # only wait for child procs
       for i in self.procs :
         if not i is None : wait();
       print("@@@ done joining procpool");
+    self.forked = True;     # don't do the waiting again if we get here twice
+  def __del__(self) :
+    self.deleter();
 
 class AsyncPool(object) :
   """ AsyncPool is a wrapper that encloses ProcessPool. The reason is so that
@@ -104,14 +107,26 @@ class AsyncPool(object) :
   def ischild(self) :
     return self.pool.forked;
   def deleter(self) :
-    if not self.ischild() :
+    print("@@@ self.deleter()");
+    try :
+      ch = self.ischild();
+    except : return;
+    if not ch :
       self.loader.kill();
       with self.pool.xfer.cv :
         self.pool.xfer.msg = KillMessage();
-      self.comm_thread.join();
+        self.pool.xfer.cv.notify_all();
       self.loader_thread.join();
+      self.comm_thread.join();
+      self.pool.deleter();
       del self.pool;
-  def __del__(self) : self.deleter();
+  def __del__(self) :
+    self.deleter();
+  def __enter__(self) :
+    return self;
+  def __exit__(self,type,value,tb) :
+    self.deleter();
+    return False;
 
 
 class Request(ABC) :
@@ -335,7 +350,7 @@ def exec_loop(pool,rank=ROOT_RANK,tag=DEFAULT_TAG) :
   signal(SIGALRM,sighandler);       # arrange to capture SIGALRM
   while True :
     msg = myrecv(pool,rank,tag);
-    if type(msg) is KillMessage :
+    if type(msg) is KillMessage :     # OK, time to leave
       break;
     if type(msg) is ExecMessage :
       func = msg.func if not isinstance(msg.func,str) else eval(msg.func);
@@ -380,45 +395,48 @@ class MessageHandle(object) :
     return self.priority < other.priority;
 
 class Loader(object) :
-  _loading = PriorityQueue();
-  lock = Lock();          # lock for modifying loading list
-  _kill = False;
-
   def __init__(self,pool) :
     self.pool = pool;
+    self._kill = False;
+    self.lock = Lock();
+    self._loading = PriorityQueue();
+    self._killed = False;
 
   def load(self,*v,priority=0,timeout=None) :     # returns message handle to the job
     with self.pool.ack :
       with self.lock :
         m = MessageHandle(v,priority=priority,timeout=timeout);
-        Loader._loading.put(m);
+        self._loading.put(m);
       self.pool.ack.notify_all();    # notify loadloop of new stuff
     return m;
 
   def kill(self) :
-    Loader._kill = True;
+    with self.pool.ack :
+      self._kill = True;
+      self.pool.ack.notify_all();
+    while not self._killed : pass;      # wait for empty queue
 
   def loading_loop(self) :
     xfer = self.pool.xfer;
-    while not Loader._kill :
+    while not self._kill :
       with self.pool.ack :
         # NOTE: drops out at timeout even with none available
         #       This is needed in case of missed notify at startup, etc.
         self.pool.ack.wait_for(\
-            lambda : (not Loader._loading.empty() \
+            lambda : (not self._loading.empty() \
                         and self.pool.avail()),timeout=0.1)
 
-      if Loader._kill : break;
+      if self._kill : break;
 
       nmax = self.pool.avail();
       if not nmax : continue;       # nobody is free now
 
       toremove = [];
-      with Loader.lock :
-        while not Loader._loading.empty() :
+      with self.lock :
+        while not self._loading.empty() :
           n = self.pool.nonblock_get_avail_rank();
           if n is None : break;         # no ranks available
-          i = Loader._loading.get();      # will not block
+          i = self._loading.get();      # will not block
           # load the command into the message queue
           with xfer.cv :
             xfer.ack.acquire();
@@ -433,22 +451,23 @@ class Loader(object) :
             xfer.cv.notify();
           xfer.ack.wait_for(lambda : (xfer.msg is None));
 
+    self._killed = True;      # indicator that no more tasks will be loaded
 
 def myfunc(x) :
   print("@ myfunc got",x);
 #  raise Exception("hell world!");
   return x+2;
 
-mypool = AsyncPool(3);
+#mypool = AsyncPool(3);
 
-m1 = mypool.async(myfunc,4,timeout=1);
-m2 = mypool.async(myfunc,5);
+with AsyncPool(10) as mypool :
+  m1 = mypool.async(myfunc,4,timeout=1);
+  m2 = mypool.async(myfunc,5);
 
-while not m1.ready() or not m2.ready() : sleep(0.01);
-print("@@ m1 ",m1.get(),m2.get());
+  while not m1.ready() or not m2.ready() : sleep(0.01);
+  print("@@ m1 ",m1.get(),m2.get());
 
-ms = [mypool.async(myfunc,i) for i in range(10)];
-for i in ms : print(i,i.get());
+  ms = [mypool.async(myfunc,i) for i in range(100)];
+  for i in ms : print(i,i.get());
 
-del mypool;
 
