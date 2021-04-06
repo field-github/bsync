@@ -3,7 +3,7 @@
 #from sys import *
 from copy import copy
 from pickle import dumps,loads,HIGHEST_PROTOCOL
-from threading import Thread,Condition,Lock,RLock
+from threading import Thread,Condition,Lock
 from os import open,close,write,read,O_NONBLOCK,pipe,pipe2,fork,getpid,wait
 from time import sleep
 from select import select
@@ -43,7 +43,7 @@ class ProcessPool(object) :
         self.procs.append((i,pid,rm,wm));
         self.unused.append(i);
     self.lock = Lock();       # no need to fork that lock over and over
-    self.ack = Condition();   # acknowledge new proc available
+    self.ack = Condition(Lock());   # acknowledge new proc available
     self.xfer = Xfer();
   def run_exec(self) :
     exec_loop(self);
@@ -61,8 +61,8 @@ class ProcessPool(object) :
       return rank;
   def return_avail_rank(self,p) :
     with self.lock :
-      self.unused.append(p);
       self.used.remove(p);
+      self.unused.append(p);
     with self.ack :
       self.ack.notify_all();
   def avail(self) :
@@ -74,7 +74,6 @@ class ProcessPool(object) :
     if not self.forked :      # only wait for child procs
       for i in self.procs :
         if not i is None : wait();
-      print("@@@ done joining procpool");
     self.forked = True;     # don't do the waiting again if we get here twice
   def __del__(self) :
     self.deleter();
@@ -107,7 +106,6 @@ class AsyncPool(object) :
   def ischild(self) :
     return self.pool.forked;
   def deleter(self) :
-    print("@@@ self.deleter()");
     try :
       ch = self.ischild();
     except : return;
@@ -151,7 +149,8 @@ class FakeFile(object) :
   def fileno(self) : return self.fd;
 
 def mystat(pool,req) :
-  if type(req) is SendRequest : return Status(True);
+  if type(req) is SendRequest :
+    return Status(True);
   assert type(req) is RecvRequest;
   if req.ready : return True;
   k,pid,rd,wr = pool[req.id]
@@ -193,7 +192,8 @@ def myisend(pool,rank,msg,tag=DEFAULT_TAG) :
   if msg.raw is None :
     msg.raw = add_hdr(dumps(msg,protocol=PICKLE_PROTO));
   n = write(wm,msg.raw[:MAXMSGLEN]);
-  msg.raw = msg.raw[n:];
+  if n :
+    msg.raw = msg.raw[n:];
   return SendRequest(k,ready=not msg.raw);
 
 def mysend(pool,rank,msg,tag=DEFAULT_TAG) :
@@ -207,7 +207,8 @@ def myirecv(pool,rank,tag=DEFAULT_TAG) :
 def myrecv(pool,rank,tag=DEFAULT_TAG) :
   req = myirecv(pool,rank,tag);
   k,pid,rm,wm = pool[req.id];
-  while not mystat(pool,req) : sleep(0.);
+  while not mystat(pool,req) :
+    sleep(TIMEOUT);
   req.msg = loads(req.msg);
   return req.msg;
 
@@ -217,8 +218,8 @@ class Xfer :
   def __init__(self) :
     self._kill = False;
     self.msg = None;
-    self.cv = Condition();
-    self.ack = Condition();
+    self.cv = Condition(Lock());
+    self.ack = Condition(Lock());
 
 class Message(object) :
   def __init__(self,rank,tag=DEFAULT_TAG) :
@@ -227,7 +228,7 @@ class Message(object) :
     self.req = None;
     self.raw = None;
     self.notified = False;
-    self.cv = Condition();      # NOTE: can't be pickled
+    self.cv = Condition(Lock());      # NOTE: can't be pickled
   def __getstate__(self) :      # remove cv property to allow pickling
     d = copy(self.__dict__);
     d['cv'] = None;
@@ -311,6 +312,7 @@ def comm_loop(pool) :
         for t in toremove :                 # now remove everyone that needs removing
           polling.remove(t);
 
+      
       if sending :
         toremove = [];
         for s in sending :
@@ -383,9 +385,10 @@ class MessageHandle(object) :
   def ready(self) :
     return self.msg.notified if hasattr(self,'msg') else False;
   def get(self,reraise=True) :
-    while not hasattr(self,'msg') : sleep(0);
-    with self.msg.cv :
-      self.msg.cv.wait_for(lambda : self.msg.notified);
+    while not hasattr(self,'msg') : sleep(TIMEOUT);
+    if not self.msg.notified :
+      with self.msg.cv :
+        self.msg.cv.wait_for(lambda : self.msg.notified);
     if reraise and isinstance(self.msg.msg.msg,ProcException) :
       raise self.msg.msg.msg.exc;
     return self.msg.msg.msg;
@@ -403,10 +406,10 @@ class Loader(object) :
     self._killed = False;
 
   def load(self,*v,priority=0,timeout=None) :     # returns message handle to the job
+    with self.lock :
+      m = MessageHandle(v,priority=priority,timeout=timeout);
+      self._loading.put(m);
     with self.pool.ack :
-      with self.lock :
-        m = MessageHandle(v,priority=priority,timeout=timeout);
-        self._loading.put(m);
       self.pool.ack.notify_all();    # notify loadloop of new stuff
     return m;
 
@@ -432,24 +435,27 @@ class Loader(object) :
       if not nmax : continue;       # nobody is free now
 
       toremove = [];
-      with self.lock :
-        while not self._loading.empty() :
+      while True :
+        with self.lock :      # only hold this lock for as short a time as possible
+          if self._loading.empty() : break;
           n = self.pool.nonblock_get_avail_rank();
-          if n is None : break;         # no ranks available
-          i = self._loading.get();      # will not block
-          # load the command into the message queue
-          with xfer.cv :
-            xfer.ack.acquire();
-            xfer.msg = ExecMessage(n,*i.params,timeout=i.timeout);
-            xfer.cv.notify();
-          xfer.ack.wait_for(lambda : (xfer.msg is None));
-          # load the receiver of the return response into the message queue
-          with xfer.cv :
-            xfer.ack.acquire();
-            xfer.msg = RecvMessage(n);
-            i.attach(xfer.msg);                  # attach message to MessageHandle
-            xfer.cv.notify();
-          xfer.ack.wait_for(lambda : (xfer.msg is None));
+        if n is None : break;
+        i = self._loading.get();      # will not block
+        # load the command into the message queue
+        with xfer.cv :
+          xfer.ack.acquire();       # must release on all circumstances!
+          xfer.msg = ExecMessage(n,*i.params,timeout=i.timeout);
+          xfer.cv.notify();
+        xfer.ack.wait_for(lambda : (xfer.msg is None));
+        xfer.ack.release();
+        # load the receiver of the return response into the message queue
+        with xfer.cv :
+          xfer.ack.acquire();       # must release on all circumstances!
+          xfer.msg = RecvMessage(n);
+          i.attach(xfer.msg);                  # attach message to MessageHandle
+          xfer.cv.notify();
+        xfer.ack.wait_for(lambda : (xfer.msg is None));
+        xfer.ack.release();
 
     self._killed = True;      # indicator that no more tasks will be loaded
 
@@ -460,14 +466,15 @@ def myfunc(x) :
 
 #mypool = AsyncPool(3);
 
-with AsyncPool(10) as mypool :
-  m1 = mypool.async(myfunc,4,timeout=1);
-  m2 = mypool.async(myfunc,5);
+with AsyncPool(3) as mypool :
+  if True :
+    m1 = mypool.async(myfunc,4,timeout=1);
+    m2 = mypool.async(myfunc,5);
+    while not m1.ready() or not m2.ready() : sleep(0.01);
+    print("@@ m1 ",m1.get(),m2.get());
 
-  while not m1.ready() or not m2.ready() : sleep(0.01);
-  print("@@ m1 ",m1.get(),m2.get());
-
-  ms = [mypool.async(myfunc,i) for i in range(100)];
+  ms = [mypool.async(myfunc,i) for i in range(200)];
+  while not all([_.ready() for _ in ms]) : sleep(0.1);
   for i in ms : print(i,i.get());
 
 
