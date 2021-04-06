@@ -44,6 +44,9 @@ class ProcessPool(object) :
         self.unused.append(i);
     self.lock = Lock();       # no need to fork that lock over and over
     self.ack = Condition();   # acknowledge new proc available
+    self.xfer = Xfer();
+  def run_exec(self) :
+    exec_loop(self);
   def get_ranks(self) :
     return [_[0] for _ in self.procs if _];      # list of ranks
   def get_avail_rank(self) :
@@ -81,34 +84,33 @@ class AsyncPool(object) :
   when the AsyncPool is first called. Note that both AsyncPool and
   ProcessPool are singletons and will not allow multiple instantiation
   in a program. """
-  _inited = False;
   def __init__(self,*v,**args) :
-    assert not AsyncPool._inited,"AsyncPool is a singleton";
-    AsyncPool.pool = ProcessPool(*v,**args);
-    AsyncPool._inited = True;
+    self.pool = ProcessPool(*v,**args);
     if not self.ischild() :
-      AsyncPool.loader = Loader();
-      AsyncPool.comm_thread = \
-          Thread(target=comm_loop,args=(AsyncPool.pool.get_ranks(),));
-      AsyncPool.comm_thread.start();
-      AsyncPool.loader_thread = \
-          Thread(target=AsyncPool.loader.loading_loop);
-      AsyncPool.loader_thread.start();
-      AsyncPool.instance = self;
-#      atexit.register(lambda : AsyncPool.instance.__del__);
+      self.loader = Loader(self.pool);
+      self.comm_thread = \
+          Thread(target=comm_loop,args=(self.pool,));
+      self.comm_thread.start();
+      self.loader_thread = \
+          Thread(target=self.loader.loading_loop);
+      self.loader_thread.start();
+    else :
+      # Run the exec loop in the child process in the event
+      # that the child is a forked process
+      self.pool.run_exec();
+      exit(0);
   def async(self,*v,**args) :
-    return AsyncPool.loader.load(*v,**args);
+    return self.loader.load(*v,**args);
   def ischild(self) :
-    return AsyncPool.pool.forked;
+    return self.pool.forked;
   def deleter(self) :
-    if getattr(AsyncPool,'instance',None) :
-      AsyncPool.loader.kill();
-      with xfer.cv :
-        xfer.msg = KillMessage();
-      AsyncPool.comm_thread.join();
-      AsyncPool.loader_thread.join();
-      del AsyncPool.pool;
-      AsyncPool.instance = None;
+    if not self.ischild() :
+      self.loader.kill();
+      with self.pool.xfer.cv :
+        self.pool.xfer.msg = KillMessage();
+      self.comm_thread.join();
+      self.loader_thread.join();
+      del self.pool;
   def __del__(self) : self.deleter();
 
 
@@ -117,23 +119,27 @@ class Request(ABC) :
     self.id = k;
     self.msg = msg;
     self.ready = ready;
+
 class SendRequest(Request) : pass;
+
 class RecvRequest(Request) : pass;
 
 class Status(object) :
+  """ a wrapper class for a bool to provide for future enhancements """
   def __init__(self,b) : self._bool = b;
   def __bool__(self) : return self._bool;
 
 class FakeFile(object) :
+  """ a class that wraps and integer and provides a fileno method for access """
   def __init__(self,n) : self.fd = n;
   def __int__(self) : return self.fd;
   def fileno(self) : return self.fd;
 
-def mystat(req) :
+def mystat(pool,req) :
   if type(req) is SendRequest : return Status(True);
   assert type(req) is RecvRequest;
   if req.ready : return True;
-  k,pid,rd,wr = AsyncPool.pool[req.id]
+  k,pid,rd,wr = pool[req.id]
   r_rdy,w_rdy,e_rdy = select([FakeFile(rd),],[],[],0.);
   if r_rdy :
     data = read(rd,MAXMSGLEN);
@@ -145,6 +151,11 @@ def mystat(req) :
       _,req.msg = remove_hdr(req.msg);
       req.ready = True;
   return req.ready;
+
+def myget(pool,req) :
+  while not mystat(pool,req) : sleep(0.);
+  req.msg = loads(req.msg);
+  return req.msg;
 
 def add_hdr(msg) :
   return pack('L',len(msg)+8)+msg;      # total length including count
@@ -159,49 +170,40 @@ def remove_hdr(msg) :
   msg = msg[8:];
   return hdr,msg;
 
-class RawMessage(object) :
-  def __init__(self,data) : self.raw = data;
-
-def myisend(rank,msg,tag=DEFAULT_TAG) :
-  k,pid,rm,wm = AsyncPool.pool[rank];
+def myisend(pool,rank,msg,tag=DEFAULT_TAG) :
+  k,pid,rm,wm = pool[rank];
   # NOTE: Condition variables are not pickleable and so we have to excise
-  #  them from the object before pickling them to send down the line
-  if not isinstance(msg,Message) :
-    msg = RawMessage(add_hdr(dumps(msg,protocol=PICKLE_PROTO)));
-  elif msg.raw is None :
+  #  them from the object before pickling them to send down the line. This
+  # happens in a __getstate__ method in the Message superclass.
+  if msg.raw is None :
     msg.raw = add_hdr(dumps(msg,protocol=PICKLE_PROTO));
   n = write(wm,msg.raw[:MAXMSGLEN]);
   msg.raw = msg.raw[n:];
   return SendRequest(k,ready=not msg.raw);
 
-def mysend(rank,msg,tag=DEFAULT_TAG) :
-  while not myisend(rank,msg,tag).ready : sleep(0);
+def mysend(pool,rank,msg,tag=DEFAULT_TAG) :
+  while not myisend(pool,rank,msg,tag).ready : sleep(0);
   return True;
 
-def myirecv(rank,tag=DEFAULT_TAG) :
-  k,pid,rm,wm = AsyncPool.pool[rank];
+def myirecv(pool,rank,tag=DEFAULT_TAG) :
+  k,pid,rm,wm = pool[rank];
   return RecvRequest(k);
 
-def myrecv(rank,tag=DEFAULT_TAG) :
-  req = myirecv(rank,tag);
-  k,pid,rm,wm = AsyncPool.pool[req.id];
-  while not mystat(req) : sleep(0.);
+def myrecv(pool,rank,tag=DEFAULT_TAG) :
+  req = myirecv(pool,rank,tag);
+  k,pid,rm,wm = pool[req.id];
+  while not mystat(pool,req) : sleep(0.);
   req.msg = loads(req.msg);
   return req.msg;
 
 # ========================================================================
 
 class Xfer :
-  _inited = False;
-  _kill = False;
-  msg = None;
-  cv = Condition();
-  ack = Condition();
   def __init__(self) :
-    assert not self._inited,"Xfer is a singleton";
-    Xfer._inited = True;
-xfer = Xfer();
-
+    self._kill = False;
+    self.msg = None;
+    self.cv = Condition();
+    self.ack = Condition();
 
 class Message(object) :
   def __init__(self,rank,tag=DEFAULT_TAG) :
@@ -247,9 +249,10 @@ class KillMessage(Message) :
   def __init__(self) :
     super(KillMessage,self).__init__(ROOT_RANK);
 
-def comm_loop(ranks=[]) :
+def comm_loop(pool) :
   polling = [];
   sending = [];
+  xfer = pool.xfer;         # alias for the Xfer object
   with xfer.cv :
     while not xfer._kill :
       xfer.cv.wait_for(lambda :(xfer.msg or xfer._kill),timeout=TIMEOUT);
@@ -267,10 +270,10 @@ def comm_loop(ranks=[]) :
         elif typ is RecvMessage :
           polling.append(xfer.msg);
         elif typ is KillMessage :
-          for i in ranks :
+          for i in pool.get_ranks() :
             # NOTE: perhaps would be better to queue this up in sending list?
             x = copy(xfer.msg);
-            MPI_send(i,x,x.tag);          # broadcast kill to everyone
+            mysend(pool,i,x,x.tag);          # broadcast kill to everyone
           break;
 
       xfer.msg = None;  # OK, got this message so clear it for next one
@@ -279,15 +282,15 @@ def comm_loop(ranks=[]) :
         toremove = [];  # list of connections to drop from the polling list
         for p in polling :
           if p.req is None :
-            p.req = MPI_Irecv(p.rank,p.tag);
-          p.stat = MPI_Stat(p.req);
+            p.req = myirecv(pool,p.rank,p.tag);
+          p.stat = mystat(pool,p.req);
           if p.stat :
             if not p.notified :
               with p.cv :
                 if type(p) is RecvMessage :
-                  p.msg = MPI_Get(p.req);       # should not block here as msg is ready
+                  p.msg = myget(pool,p.req);       # should not block here as msg is ready
                 p.notified = True;
-                AsyncPool.pool.return_avail_rank(p.rank);
+                pool.return_avail_rank(p.rank);
                 p.cv.notify_all();
             toremove.append(p);             # don't change polling inside the loop
         for t in toremove :                 # now remove everyone that needs removing
@@ -297,9 +300,9 @@ def comm_loop(ranks=[]) :
         toremove = [];
         for s in sending :
           if s.req is None or not s.req.ready:
-            s.req = MPI_Isend(s.rank,s,s.tag);
+            s.req = myisend(pool,s.rank,s,s.tag);
             if not s.req.ready : continue;
-          s.stat = MPI_Stat(s.req);
+          s.stat = mystat(pool,s.req);
           if s.stat :
             if not s.notified :
               with s.cv :
@@ -316,29 +319,6 @@ def comm_loop(ranks=[]) :
 
 
 
-class MPImsg(object) :
-  def __init__(self,req) :
-    self.req = req;
-
-def MPI_Isend(rank,msg,tag=DEFAULT_TAG) :
-  return myisend(rank,msg,tag);
-
-def MPI_send(rank,msg,tag=DEFAULT_TAG) :
-  return mysend(rank,msg,tag);
-
-def MPI_Irecv(rank,tag=DEFAULT_TAG) :
-  req = myirecv(rank,tag);
-  return req;
-
-def MPI_Stat(req) :
-  return mystat(req);
-
-def MPI_Get(req) :
-  while not mystat(req) : sleep(0.);
-  req.msg = loads(req.msg);
-  return req.msg;
-
-
 class ProcException(Exception) :
   """ special exception that contains another exception for sending
     across the MPI connection """
@@ -351,10 +331,10 @@ def sighandler(signum,frame) :      # sigalrm handler raises exception on timeou
 # this is the execution loop on the remote end. All it does is receive commands
 # and then executes them in a blocking fashion. If it receives a KillMessage,
 # then drop out of the loop. Timeouts are 
-def exec_loop(rank=ROOT_RANK,tag=DEFAULT_TAG) :
+def exec_loop(pool,rank=ROOT_RANK,tag=DEFAULT_TAG) :
   signal(SIGALRM,sighandler);       # arrange to capture SIGALRM
   while True :
-    msg = myrecv(rank,tag);
+    msg = myrecv(pool,rank,tag);
     if type(msg) is KillMessage :
       break;
     if type(msg) is ExecMessage :
@@ -376,7 +356,7 @@ def exec_loop(rank=ROOT_RANK,tag=DEFAULT_TAG) :
         retval = Exception("Alarm timeout race in exec_loop");
       finally :
         if timeout : alarm(0);
-      mysend(rank,ReturnMessage(rank,retval,tag),tag);
+      mysend(pool,rank,ReturnMessage(rank,retval,tag),tag);
       del retval,func;
 
 class MessageHandle(object) :
@@ -402,42 +382,41 @@ class MessageHandle(object) :
 class Loader(object) :
   _loading = PriorityQueue();
   lock = Lock();          # lock for modifying loading list
-  _inited = False;
   _kill = False;
 
-  def __init__(self) :
-    assert not Loader._inited,"Loader is a singleton";
-    Loader._inited = True;
+  def __init__(self,pool) :
+    self.pool = pool;
 
   def load(self,*v,priority=0,timeout=None) :     # returns message handle to the job
-    with AsyncPool.pool.ack :
+    with self.pool.ack :
       with self.lock :
         m = MessageHandle(v,priority=priority,timeout=timeout);
         Loader._loading.put(m);
-      AsyncPool.pool.ack.notify_all();    # notify loadloop of new stuff
+      self.pool.ack.notify_all();    # notify loadloop of new stuff
     return m;
 
   def kill(self) :
     Loader._kill = True;
 
   def loading_loop(self) :
+    xfer = self.pool.xfer;
     while not Loader._kill :
-      with AsyncPool.pool.ack :
+      with self.pool.ack :
         # NOTE: drops out at timeout even with none available
         #       This is needed in case of missed notify at startup, etc.
-        AsyncPool.pool.ack.wait_for(\
+        self.pool.ack.wait_for(\
             lambda : (not Loader._loading.empty() \
-                        and AsyncPool.pool.avail()),timeout=0.1)
+                        and self.pool.avail()),timeout=0.1)
 
       if Loader._kill : break;
 
-      nmax = AsyncPool.pool.avail();
+      nmax = self.pool.avail();
       if not nmax : continue;       # nobody is free now
 
       toremove = [];
       with Loader.lock :
         while not Loader._loading.empty() :
-          n = AsyncPool.pool.nonblock_get_avail_rank();
+          n = self.pool.nonblock_get_avail_rank();
           if n is None : break;         # no ranks available
           i = Loader._loading.get();      # will not block
           # load the command into the message queue
@@ -455,7 +434,6 @@ class Loader(object) :
           xfer.ack.wait_for(lambda : (xfer.msg is None));
 
 
-
 def myfunc(x) :
   print("@ myfunc got",x);
 #  raise Exception("hell world!");
@@ -463,20 +441,14 @@ def myfunc(x) :
 
 mypool = AsyncPool(3);
 
-if mypool.ischild() :
-  exec_loop();
-  exit(0);
-else :
+m1 = mypool.async(myfunc,4,timeout=1);
+m2 = mypool.async(myfunc,5);
 
-  if True :
-    m1 = mypool.async(myfunc,4,timeout=1);
-    m2 = mypool.async(myfunc,5);
+while not m1.ready() or not m2.ready() : sleep(0.01);
+print("@@ m1 ",m1.get(),m2.get());
 
-#    while not m1.ready() or not m2.ready() : sleep(0.01);
-    print("@@ m1 ",m1.get(),m2.get());
+ms = [mypool.async(myfunc,i) for i in range(10)];
+for i in ms : print(i,i.get());
 
-    ms = [mypool.async(myfunc,i) for i in range(10)];
-    for i in ms : print(i,i.get());
-
-  mypool.deleter();
+del mypool;
 
