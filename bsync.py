@@ -299,9 +299,10 @@ def _(poolproc,tag=DEFAULT_TAG) :
 
 @messg_stat.register(ForkProcessHandle)
 def _(poolproc,req) :
+  assert type(req) in [RecvRequest,SendRequest],\
+              "messg_stat received incorrect type" % str(type(req);
   if type(req) is SendRequest :
     return Status(True);
-  assert type(req) is RecvRequest;
   if req.ready : return True;
   rd,wr = poolproc.rwfileno;
   r_rdy,w_rdy,e_rdy = select([FakeFile(rd),],[],[],0.);
