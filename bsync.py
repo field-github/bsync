@@ -12,12 +12,14 @@ from struct import pack,unpack
 from queue import PriorityQueue
 from signal import signal,alarm,SIGALRM
 import atexit
+from numbers import Integral
+from functools import singledispatch
 
 PICKLE_PROTO = 2;     # pickle protocol to use
 TIMEOUT = 0.001;
 DEFAULT_TAG = -1;
 ROOT_RANK = 0;        # the controller rank
-MAXMSGLEN = 1000; #1<<20;
+MAXPACKETLEN = 1000; #1<<20;
 
 # ========================================================================
 
@@ -30,35 +32,65 @@ class Xfer :
     self.cv = Condition(Lock());
     self.ack = Condition(Lock());
 
+class ProcessHandle(ABC) :
+  def __init__(self,**args) :
+    for k,v in args.items() :
+      self.__dict__[k] = v;
+  @property
+  def rank(self) : return self.rank;
+
+class ForkProcessHandle(ProcessHandle) :
+  def __init__(self,rank,pid,rd,wr) :
+    super(ForkProcessHandle,self).__init__(rank=rank,pid=pid,rd=rd,wr=wr);
+  @property
+  def rwfileno(self) : return self.rd,self.wr;
+  @property
+  def pid(self) : return self.pid;
+
+class MPIProcessHandle(ProcessHandle) :
+  def __init__(self,rank) :
+    super(MPIProcessHandle,self).__init__(rank=rank);
+
 class ProcessPool(object) :
   """ the pool of exec child processes """
   def __init__(self,n,tag=DEFAULT_TAG) :
-    self.procs = [None,];
+    """ initialize process pool.
+        NOTE: tag is only used in MPI communications, not for forked processes
+      __init__
+        Args:
+          n(int or list/tuple):       number of processes OR list of ranks to use
+          tag(int):                   MPI tag to use in communications
+    """
+    self.procs = [];
     self.unused = [];
     self.used = [];
-    self.count = n;
+    if isinstance(n,Integral) :
+      self.count = n;
+      n = range(n);
+    else :
+      self.count = len(n);
     self.forked = False;
-    for i in range(1,self.count+1) :
+    for i in n :
       rs,wm = pipe2(O_NONBLOCK);
       rm,ws = pipe2(O_NONBLOCK);
       pid = fork();
       if not pid :
         close(wm);close(rm);
-        self.procs = [(ROOT_RANK,getpid(),rs,ws)];    # set fds for ROOT_RANK
+        self.procs = [ForkProcessHandle(ROOT_RANK,getpid(),rs,ws),];
         self.forked = True;
         return;
       else :
         close(ws);close(rs);
         # proc tuple is (rank#, pid, read file descriptor, write file descriptor)
-        self.procs.append((i,pid,rm,wm));
+        self.procs.append(ForkProcessHandle(i,getpid(),rm,wm));
         self.unused.append(i);
     self.lock = Lock();       # no need to fork that lock over and over
     self.ack = Condition(Lock());   # acknowledge new proc available
     self.xfer = Xfer();
   def run_exec(self) :
     exec_loop(self);
-  def get_ranks(self) :
-    return [_[0] for _ in self.procs if _];      # list of ranks
+  def get_size(self) :
+    return list(range(len(self.procs)));      # list of ranks
   def get_avail_rank(self) :
     while True :
       n = self.nonblock_get_avail_rank();
@@ -138,8 +170,8 @@ class AsyncPool(object) :
 
 
 class Request(ABC) :
-  def __init__(self,k,msg=None,ready=False) :
-    self.id = k;
+  def __init__(self,proc,msg=None,ready=False) :
+    self.proc = proc;
     self.msg = msg;
     self.ready = ready;
 
@@ -181,44 +213,101 @@ class FakeFile(object) :
   def __int__(self) : return self.fd;
   def fileno(self) : return self.fd;
 
-def messg_isend(pool,rank,msg,tag=DEFAULT_TAG) :
-  k,pid,rm,wm = pool[rank];
+# ------------- dispatch control by child type MPI or forked -----------
+
+@singledispatch
+def messg_isend(poolproc,msg,tag=DEFAULT_TAG) :
+  raise NotImplementedError("Unsupported type: %s" % type(poolproc));
+
+@singledispatch
+def messg_send(poolproc,msg,tag=DEFAULT_TAG) :
+  raise NotImplementedError("Unsupported type: %s" % type(poolproc));
+
+@singledispatch
+def messg_irecv(poolproc,tag=DEFAULT_TAG) :
+  raise NotImplementedError("Unsupported type: %s" % type(poolproc));
+
+@singledispatch
+def messg_recv(poolproc,tag=DEFAULT_TAG) :
+  """ messg_recv is different than messg_get in that it creates
+      the receive request. messg_get is used when you already have
+      the receive request and you want to continue the receiving
+      operation. This will block until the entire message is received. """
+  raise NotImplementedError("Unsupported type: %s" % type(poolproc));
+
+@singledispatch
+def messg_stat(poolproc,req) :
+  raise NotImplementedError("Unsupported type: %s" % type(poolproc));
+
+@singledispatch
+def messg_get(poolproc,req) :
+  """ messg_get is different than message_recv in that it assumes
+      you already have a request object for this receive. If you
+      don't have a request object yet, then use messg_recv. But,
+      like messg_recv, it will block until the entire message is received. """
+  raise NotImplementedError("Unsupported type: %s" % type(poolproc));
+
+# ------------ forked child communication functions --------------------
+#   isend, send         <--- unblocking and blocking send
+#   irecv, recv         <--- unblocking and blocking recv
+#   stat                <---- check on the received status of isend or irecv
+#   get, [not implemented] put      <--- blocking wait for full receive
+#
+# NOTE:  isend and irecv return Request objects which only indicate that
+#  a sending/receiving operation has started. It does not mean that
+#  the operation has completed. These operations may involve multiple
+#  MPI operations or multiple pipe read/writes. Furthermore, because of
+#  quirks in the way MPI interface works, those sends and receives can
+#  take place *either* in the isend/irecv OR the stat function.
+
+@messg_isend.register(ForkProcessHandle)
+def messg_isend(poolproc,msg,tag=DEFAULT_TAG) :
+  rm,wm = poolproc.rwfileno;
   # NOTE: Condition variables are not pickleable and so we have to excise
   #  them from the object before pickling them to send down the line. This
   # happens in a __getstate__ method in the Message superclass.
   if msg.raw is None :
     msg.raw = add_hdr(dumps(msg,protocol=PICKLE_PROTO));
-  n = write(wm,msg.raw[:MAXMSGLEN]);
-  if n :
-    msg.raw = msg.raw[n:];
-  return SendRequest(k,ready=not msg.raw);
+  # NOTE: maybe should wrap this in the event of strange OSErrors
+  #   and/or write count of zero indicating error
+  rd,wr = poolproc.rwfileno;
+  while True :
+    r_rdy,w_rdy,e_rdy = select([],[FakeFile(wr),],[],0.);
+    if w_rdy :
+      n = write(wm,msg.raw[:MAXPACKETLEN]);
+      if n :
+        msg.raw = msg.raw[n:];
+      if not msg.raw : break;         # written the whole message now
+    else :
+      break;
+  return SendRequest(poolproc,ready=not msg.raw);
 
-def messg_send(pool,rank,msg,tag=DEFAULT_TAG) :
-  while not messg_isend(pool,rank,msg,tag).ready : sleep(0);
+@messg_send.register(ForkProcessHandle)
+def _(poolproc,msg,tag=DEFAULT_TAG) :
+  """ blocking send. """
+  while not messg_isend(poolproc,msg,tag).ready : sleep(0);
   return True;
 
-def messg_irecv(pool,rank,tag=DEFAULT_TAG) :
-  k,pid,rm,wm = pool[rank];
-  return RecvRequest(k);
+@messg_irecv.register(ForkProcessHandle)
+def _(poolproc,tag=DEFAULT_TAG) :
+  return RecvRequest(poolproc);
 
-def messg_recv(pool,rank,tag=DEFAULT_TAG) :
-  req = messg_irecv(pool,rank,tag);
-  k,pid,rm,wm = pool[req.id];
-  while not messg_stat(pool,req) :
-    sleep(TIMEOUT);
-  req.msg = loads(req.msg);
-  return req.msg;
+@messg_recv.register(ForkProcessHandle)
+def _(poolproc,tag=DEFAULT_TAG) :
+  req = messg_irecv(poolproc,tag);
+  return messg_get(poolproc,req);
 
-def messg_stat(pool,req) :
+@messg_stat.register(ForkProcessHandle)
+def _(poolproc,req) :
   if type(req) is SendRequest :
     return Status(True);
   assert type(req) is RecvRequest;
   if req.ready : return True;
-  k,pid,rd,wr = pool[req.id]
+  rd,wr = poolproc.rwfileno;
   r_rdy,w_rdy,e_rdy = select([FakeFile(rd),],[],[],0.);
   if r_rdy :
     # TODO: make max read length equal to remaining message characters
-    data = read(rd,MAXMSGLEN);
+    data = read(rd,MAXPACKETLEN);
     if req.msg is None :
       req.msg = data;
     else :
@@ -228,17 +317,20 @@ def messg_stat(pool,req) :
       req.ready = True;
   return req.ready;
 
-def messg_get(pool,req) :
-  while not messg_stat(pool,req) : sleep(0.);
+@messg_get.register(ForkProcessHandle)
+def _(poolproc,req) :
+  while not messg_stat(poolproc,req) : sleep(TIMEOUT);
   req.msg = loads(req.msg);
   return req.msg;
+
+# --------------------------------------------------------------------
 
 # ================= Message wrapping classes =====================
 
 class Message(ABC) :
   """ abstract base class for messages to send or received """
-  def __init__(self,rank,tag=DEFAULT_TAG) :
-    self.rank = rank;
+  def __init__(self,procno,tag=DEFAULT_TAG) :
+    self.procno = procno;
     self.tag = tag;
     self.req = None;
     self.raw = None;
@@ -251,14 +343,14 @@ class Message(ABC) :
 
 class RecvMessage(Message) :
   """ a class representing a message to be received """
-  def __init__(self,rank,tag=DEFAULT_TAG) :
-    super(RecvMessage,self).__init__(rank,tag=tag);
+  def __init__(self,procno,tag=DEFAULT_TAG) :
+    super(RecvMessage,self).__init__(procno,tag=tag);
 
 class SendMessage(Message) :
   """ a class representing a message to be sent """
-  def __init__(self,rank,msg,tag=DEFAULT_TAG) :
+  def __init__(self,procno,msg,tag=DEFAULT_TAG) :
     self.msg = msg;
-    super(SendMessage,self).__init__(rank,tag=tag);
+    super(SendMessage,self).__init__(procno,tag=tag);
   @property
   def func(self) : return self.msg[0];
   @property
@@ -266,19 +358,19 @@ class SendMessage(Message) :
 
 class ReturnMessage(Message) :
   """ a class for returning results from the exec_loop """
-  def __init__(self,rank,msg,tag=DEFAULT_TAG) :
+  def __init__(self,procno,msg,tag=DEFAULT_TAG) :
     self.msg = msg;
-    super(ReturnMessage,self).__init__(rank,tag);
+    super(ReturnMessage,self).__init__(procno,tag);
 
 class ExecMessage(SendMessage) :
   """ a class for making execute requests of the exec_loop """
-  def __init__(self,rank,f,*args,tag=DEFAULT_TAG,timeout=None) :
+  def __init__(self,procno,f,*args,tag=DEFAULT_TAG,timeout=None) :
     try :
       dumps(f,protocol=PICKLE_PROTO);
     except :
       f = "__main__.%s.__name__" % f.__name__;
     self.timeout = timeout;
-    super(ExecMessage,self).__init__(rank,(f,)+args,tag);
+    super(ExecMessage,self).__init__(procno,(f,)+args,tag);
 
 class KillMessage(Message) :
   """ a class indicating the exec_loop should shut down and exit """
@@ -309,10 +401,10 @@ def comm_loop(pool) :
         elif typ is RecvMessage :
           polling.append(xfer.msg);
         elif typ is KillMessage :
-          for i in pool.get_ranks() :
+          for i in pool.get_size() :
             # NOTE: perhaps would be better to queue this up in sending list?
             x = copy(xfer.msg);
-            messg_send(pool,i,x,x.tag);          # broadcast kill to everyone
+            messg_send(pool[i],x,x.tag);          # broadcast kill to everyone
           break;
 
       xfer.msg = None;  # OK, got this message so clear it for next one
@@ -321,15 +413,15 @@ def comm_loop(pool) :
         toremove = [];  # list of connections to drop from the polling list
         for p in polling :
           if p.req is None :
-            p.req = messg_irecv(pool,p.rank,p.tag);
-          p.stat = messg_stat(pool,p.req);
+            p.req = messg_irecv(pool[p.procno],p.tag);
+          p.stat = messg_stat(pool[p.procno],p.req);
           if p.stat :
             if not p.notified :
               with p.cv :
                 if type(p) is RecvMessage :
-                  p.msg = messg_get(pool,p.req);       # should not block here as msg is ready
+                  p.msg = messg_get(pool[p.procno],p.req);       # should not block here as msg is ready
                 p.notified = True;
-                pool.return_avail_rank(p.rank);
+                pool.return_avail_rank(p.procno);
                 p.cv.notify_all();
             toremove.append(p);             # don't change polling inside the loop
         for t in toremove :                 # now remove everyone that needs removing
@@ -340,9 +432,9 @@ def comm_loop(pool) :
         toremove = [];
         for s in sending :
           if s.req is None or not s.req.ready:
-            s.req = messg_isend(pool,s.rank,s,s.tag);
-            if not s.req.ready : continue;
-          s.stat = messg_stat(pool,s.req);
+            s.req = messg_isend(pool[s.procno],s,s.tag);
+            if not s.req.ready : continue;      # TOOD: fix this so remainder send goes out through stat
+          s.stat = messg_stat(pool[s.procno],s.req);
           if s.stat :
             if not s.notified :
               with s.cv :
@@ -374,7 +466,7 @@ def sighandler(signum,frame) :      # sigalrm handler raises exception on timeou
 def exec_loop(pool,rank=ROOT_RANK,tag=DEFAULT_TAG) :
   signal(SIGALRM,sighandler);       # arrange to capture SIGALRM
   while True :
-    msg = messg_recv(pool,rank,tag);
+    msg = messg_recv(pool[rank],tag);
     if type(msg) is KillMessage :     # OK, time to leave
       break;
     if type(msg) is ExecMessage :
@@ -396,7 +488,7 @@ def exec_loop(pool,rank=ROOT_RANK,tag=DEFAULT_TAG) :
         retval = Exception("Alarm timeout race in exec_loop");
       finally :
         if timeout : alarm(0);
-      messg_send(pool,rank,ReturnMessage(rank,retval,tag),tag);
+      messg_send(pool[rank],ReturnMessage(rank,retval,tag),tag);
       del retval,func;
 
 class MessageHandle(object) :
