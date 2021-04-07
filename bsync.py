@@ -21,7 +21,17 @@ MAXMSGLEN = 1000; #1<<20;
 
 # ========================================================================
 
+class Xfer :
+  """ A class for handing off messages between the loading queue
+      (Loader.loading_loop) and the communication loop (comm_loop) """
+  def __init__(self) :
+    self._kill = False;
+    self.msg = None;
+    self.cv = Condition(Lock());
+    self.ack = Condition(Lock());
+
 class ProcessPool(object) :
+  """ the pool of exec child processes """
   def __init__(self,n,tag=DEFAULT_TAG) :
     self.procs = [None,];
     self.unused = [];
@@ -137,39 +147,13 @@ class SendRequest(Request) : pass;
 
 class RecvRequest(Request) : pass;
 
-class Status(object) :
-  """ a wrapper class for a bool to provide for future enhancements """
-  def __init__(self,b) : self._bool = b;
-  def __bool__(self) : return self._bool;
+# =============== Message header manipulation routines
 
-class FakeFile(object) :
-  """ a class that wraps and integer and provides a fileno method for access """
-  def __init__(self,n) : self.fd = n;
-  def __int__(self) : return self.fd;
-  def fileno(self) : return self.fd;
-
-def mystat(pool,req) :
-  if type(req) is SendRequest :
-    return Status(True);
-  assert type(req) is RecvRequest;
-  if req.ready : return True;
-  k,pid,rd,wr = pool[req.id]
-  r_rdy,w_rdy,e_rdy = select([FakeFile(rd),],[],[],0.);
-  if r_rdy :
-    data = read(rd,MAXMSGLEN);
-    if req.msg is None :
-      req.msg = data;
-    else :
-      req.msg += data;
-    if len(req.msg) >= 8 and hdr_len(req.msg) == len(req.msg) :
-      _,req.msg = remove_hdr(req.msg);
-      req.ready = True;
-  return req.ready;
-
-def myget(pool,req) :
-  while not mystat(pool,req) : sleep(0.);
-  req.msg = loads(req.msg);
-  return req.msg;
+# each message has an 8-byte unsigned long integer at the start
+# of it indicating how many bytes the message is (including the
+# 8 bytes of the length field.) So, the smallest possible value
+# for that first field would be 8 indicating a message payload
+# of 0 bytes + 8 bytes for the length field
 
 def add_hdr(msg) :
   return pack('L',len(msg)+8)+msg;      # total length including count
@@ -184,7 +168,20 @@ def remove_hdr(msg) :
   msg = msg[8:];
   return hdr,msg;
 
-def myisend(pool,rank,msg,tag=DEFAULT_TAG) :
+# =====================================================
+
+class Status(object) :
+  """ a wrapper class for a bool to provide for future enhancements """
+  def __init__(self,b) : self._bool = b;
+  def __bool__(self) : return self._bool;
+
+class FakeFile(object) :
+  """ a class that wraps and integer and provides a fileno method for access """
+  def __init__(self,n) : self.fd = n;
+  def __int__(self) : return self.fd;
+  def fileno(self) : return self.fd;
+
+def messg_isend(pool,rank,msg,tag=DEFAULT_TAG) :
   k,pid,rm,wm = pool[rank];
   # NOTE: Condition variables are not pickleable and so we have to excise
   #  them from the object before pickling them to send down the line. This
@@ -196,32 +193,50 @@ def myisend(pool,rank,msg,tag=DEFAULT_TAG) :
     msg.raw = msg.raw[n:];
   return SendRequest(k,ready=not msg.raw);
 
-def mysend(pool,rank,msg,tag=DEFAULT_TAG) :
-  while not myisend(pool,rank,msg,tag).ready : sleep(0);
+def messg_send(pool,rank,msg,tag=DEFAULT_TAG) :
+  while not messg_isend(pool,rank,msg,tag).ready : sleep(0);
   return True;
 
-def myirecv(pool,rank,tag=DEFAULT_TAG) :
+def messg_irecv(pool,rank,tag=DEFAULT_TAG) :
   k,pid,rm,wm = pool[rank];
   return RecvRequest(k);
 
-def myrecv(pool,rank,tag=DEFAULT_TAG) :
-  req = myirecv(pool,rank,tag);
+def messg_recv(pool,rank,tag=DEFAULT_TAG) :
+  req = messg_irecv(pool,rank,tag);
   k,pid,rm,wm = pool[req.id];
-  while not mystat(pool,req) :
+  while not messg_stat(pool,req) :
     sleep(TIMEOUT);
   req.msg = loads(req.msg);
   return req.msg;
 
-# ========================================================================
+def messg_stat(pool,req) :
+  if type(req) is SendRequest :
+    return Status(True);
+  assert type(req) is RecvRequest;
+  if req.ready : return True;
+  k,pid,rd,wr = pool[req.id]
+  r_rdy,w_rdy,e_rdy = select([FakeFile(rd),],[],[],0.);
+  if r_rdy :
+    # TODO: make max read length equal to remaining message characters
+    data = read(rd,MAXMSGLEN);
+    if req.msg is None :
+      req.msg = data;
+    else :
+      req.msg += data;
+    if len(req.msg) >= 8 and hdr_len(req.msg) == len(req.msg) :
+      _,req.msg = remove_hdr(req.msg);
+      req.ready = True;
+  return req.ready;
 
-class Xfer :
-  def __init__(self) :
-    self._kill = False;
-    self.msg = None;
-    self.cv = Condition(Lock());
-    self.ack = Condition(Lock());
+def messg_get(pool,req) :
+  while not messg_stat(pool,req) : sleep(0.);
+  req.msg = loads(req.msg);
+  return req.msg;
 
-class Message(object) :
+# ================= Message wrapping classes =====================
+
+class Message(ABC) :
+  """ abstract base class for messages to send or received """
   def __init__(self,rank,tag=DEFAULT_TAG) :
     self.rank = rank;
     self.tag = tag;
@@ -235,10 +250,12 @@ class Message(object) :
     return d;
 
 class RecvMessage(Message) :
+  """ a class representing a message to be received """
   def __init__(self,rank,tag=DEFAULT_TAG) :
     super(RecvMessage,self).__init__(rank,tag=tag);
 
 class SendMessage(Message) :
+  """ a class representing a message to be sent """
   def __init__(self,rank,msg,tag=DEFAULT_TAG) :
     self.msg = msg;
     super(SendMessage,self).__init__(rank,tag=tag);
@@ -248,11 +265,13 @@ class SendMessage(Message) :
   def args(self) : return self.msg[1:];
 
 class ReturnMessage(Message) :
+  """ a class for returning results from the exec_loop """
   def __init__(self,rank,msg,tag=DEFAULT_TAG) :
     self.msg = msg;
     super(ReturnMessage,self).__init__(rank,tag);
 
 class ExecMessage(SendMessage) :
+  """ a class for making execute requests of the exec_loop """
   def __init__(self,rank,f,*args,tag=DEFAULT_TAG,timeout=None) :
     try :
       dumps(f,protocol=PICKLE_PROTO);
@@ -262,10 +281,14 @@ class ExecMessage(SendMessage) :
     super(ExecMessage,self).__init__(rank,(f,)+args,tag);
 
 class KillMessage(Message) :
+  """ a class indicating the exec_loop should shut down and exit """
   def __init__(self) :
     super(KillMessage,self).__init__(ROOT_RANK);
 
+# =================================================================
+
 def comm_loop(pool) :
+  """ the main loop for handling communications with the child processes """
   polling = [];
   sending = [];
   xfer = pool.xfer;         # alias for the Xfer object
@@ -289,7 +312,7 @@ def comm_loop(pool) :
           for i in pool.get_ranks() :
             # NOTE: perhaps would be better to queue this up in sending list?
             x = copy(xfer.msg);
-            mysend(pool,i,x,x.tag);          # broadcast kill to everyone
+            messg_send(pool,i,x,x.tag);          # broadcast kill to everyone
           break;
 
       xfer.msg = None;  # OK, got this message so clear it for next one
@@ -298,13 +321,13 @@ def comm_loop(pool) :
         toremove = [];  # list of connections to drop from the polling list
         for p in polling :
           if p.req is None :
-            p.req = myirecv(pool,p.rank,p.tag);
-          p.stat = mystat(pool,p.req);
+            p.req = messg_irecv(pool,p.rank,p.tag);
+          p.stat = messg_stat(pool,p.req);
           if p.stat :
             if not p.notified :
               with p.cv :
                 if type(p) is RecvMessage :
-                  p.msg = myget(pool,p.req);       # should not block here as msg is ready
+                  p.msg = messg_get(pool,p.req);       # should not block here as msg is ready
                 p.notified = True;
                 pool.return_avail_rank(p.rank);
                 p.cv.notify_all();
@@ -317,9 +340,9 @@ def comm_loop(pool) :
         toremove = [];
         for s in sending :
           if s.req is None or not s.req.ready:
-            s.req = myisend(pool,s.rank,s,s.tag);
+            s.req = messg_isend(pool,s.rank,s,s.tag);
             if not s.req.ready : continue;
-          s.stat = mystat(pool,s.req);
+          s.stat = messg_stat(pool,s.req);
           if s.stat :
             if not s.notified :
               with s.cv :
@@ -351,7 +374,7 @@ def sighandler(signum,frame) :      # sigalrm handler raises exception on timeou
 def exec_loop(pool,rank=ROOT_RANK,tag=DEFAULT_TAG) :
   signal(SIGALRM,sighandler);       # arrange to capture SIGALRM
   while True :
-    msg = myrecv(pool,rank,tag);
+    msg = messg_recv(pool,rank,tag);
     if type(msg) is KillMessage :     # OK, time to leave
       break;
     if type(msg) is ExecMessage :
@@ -373,7 +396,7 @@ def exec_loop(pool,rank=ROOT_RANK,tag=DEFAULT_TAG) :
         retval = Exception("Alarm timeout race in exec_loop");
       finally :
         if timeout : alarm(0);
-      mysend(pool,rank,ReturnMessage(rank,retval,tag),tag);
+      messg_send(pool,rank,ReturnMessage(rank,retval,tag),tag);
       del retval,func;
 
 class MessageHandle(object) :
