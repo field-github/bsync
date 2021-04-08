@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
-#from sys import *
+# UNTESTED ON MPI
+
+import __main__
 from copy import copy
 from pickle import dumps,loads,HIGHEST_PROTOCOL
 from threading import Thread,Condition,Lock
@@ -20,6 +22,15 @@ TIMEOUT = 0.001;
 DEFAULT_TAG = -1;
 ROOT_RANK = 0;        # the controller rank
 MAXPACKETLEN = 1000; #1<<20;
+
+try :
+  from mpi4py import MPI
+  comm = MPI.COMM_WORLD;
+  mpi_rank = comm.Get_rank();
+  mpi_size = comm.Get_size();
+  use_mpi = getattr(__main__,'bsync_use_mpi',True);     # default to MPI if succeed
+except :
+  use_mpi = False;
 
 # ========================================================================
 
@@ -53,7 +64,7 @@ class MPIProcessHandle(ProcessHandle) :
 
 class ProcessPool(object) :
   """ the pool of exec child processes """
-  def __init__(self,n,tag=DEFAULT_TAG) :
+  def __init__(self,n=None,tag=DEFAULT_TAG,use_fork=False) :
     """ initialize process pool.
         NOTE: tag is only used in MPI communications, not for forked processes
       __init__
@@ -64,26 +75,46 @@ class ProcessPool(object) :
     self.procs = [];
     self.unused = [];
     self.used = [];
+    self.using_mpi = False;
+
+    if use_mpi and not use_fork :
+      # use a provided list of ranks if present, otherwise try to size to
+      # the mpi ranks size *or* the integer value provided whichever is smaller
+      if n is None : n = mpi_size;
+      if isinstance(n,Integral) :
+        n = range(1,min(n,mpi_size));
+      self.using_mpi = True;
+
+    # massage n so that it is a list with the ranks, and set the count
     if isinstance(n,Integral) :
       self.count = n;
       n = range(n);
     else :
       self.count = len(n);
+
     self.forked = False;
-    for i in n :
-      rs,wm = pipe2(O_NONBLOCK);
-      rm,ws = pipe2(O_NONBLOCK);
-      pid = fork();
-      if not pid :
-        close(wm);close(rm);
-        self.procs = [ForkProcessHandle(ROOT_RANK,getpid(),rs,ws),];
-        self.forked = True;
-        return;
+
+    if not self.using_mpi :      # forked process version
+      for i in n :
+        rs,wm = pipe2(O_NONBLOCK);
+        rm,ws = pipe2(O_NONBLOCK);
+        pid = fork();
+        if not pid :
+          close(wm);close(rm);
+          self.procs = [ForkProcessHandle(ROOT_RANK,getpid(),rs,ws),];
+          self.forked = True;
+          return;
+        else :
+          close(ws);close(rs);
+          # proc tuple is (rank#, pid, read file descriptor, write file descriptor)
+          self.procs.append(ForkProcessHandle(i,getpid(),rm,wm));
+          self.unused.append(i);
+    else :        # MPI version
+      if mpi_rank == ROOT_RANK :
+        self.procs = [MPIProcessHandle(_) for _ in n];
       else :
-        close(ws);close(rs);
-        # proc tuple is (rank#, pid, read file descriptor, write file descriptor)
-        self.procs.append(ForkProcessHandle(i,getpid(),rm,wm));
-        self.unused.append(i);
+        self.procs = [MPIProcessHandle(ROOT_RANK),];
+
     self.lock = Lock();       # no need to fork that lock over and over
     self.ack = Condition(Lock());   # acknowledge new proc available
     self.xfer = Xfer();
@@ -173,11 +204,33 @@ class Request(ABC) :
   def __init__(self,proc,msg=None,ready=False) :
     self.proc = proc;
     self.msg = msg;
-    self.ready = ready;
+    if not ready is None :
+      # MPI requests use test() method to generate ready flag
+      self.ready = ready;
 
 class SendRequest(Request) : pass;
 
 class RecvRequest(Request) : pass;
+
+class MPIRequest(Request) :
+  """ a wrapper for mpi4py's Request method. It provides the procno of
+      the cpu being communicated with as well as a ready property
+      which tests for complete communication.
+      Properties:
+        proc(ProcessHandle):        Contains the rank to communicate with
+        msg(Message):               the received message
+        mpireq(MPIRequest):         mpi4py MPIRequest object
+  """
+  def __init__(self,mpireq,proc,msg=None,ready=False) :
+    self.mpireq = mpireq;
+    super(MPIRequest,self).__init__(proc,ready=None);
+  @property
+  def ready(self) :
+    return self.mpireq.test();            # return the test for done
+
+class MPIRecvRequest(MPIRequest) : pass;
+
+class MPISendRequest(MPIRequest) : pass;
 
 # =============== Message header manipulation routines
 
@@ -201,11 +254,6 @@ def remove_hdr(msg) :
   return hdr,msg;
 
 # =====================================================
-
-class Status(object) :
-  """ a wrapper class for a bool to provide for future enhancements """
-  def __init__(self,b) : self._bool = b;
-  def __bool__(self) : return self._bool;
 
 class FakeFile(object) :
   """ a class that wraps and integer and provides a fileno method for access """
@@ -253,7 +301,7 @@ def messg_get(poolproc,req) :
       like messg_recv, it will block until the entire message is received. """
   raise NotImplementedError("Unsupported type: %s" % type(poolproc));
 
-# ------------ forked child communication functions --------------------
+# ------------ forked child communication primitives --------------------
 #   isend, send         <--- unblocking and blocking send
 #   irecv, recv         <--- unblocking and blocking recv
 #   stat                <---- check on the received status of isend or irecv
@@ -265,7 +313,7 @@ def messg_get(poolproc,req) :
 #  given procpool type
 
 @messg_isend.register(ForkProcessHandle)
-def messg_isend(poolproc,msg,tag=DEFAULT_TAG) :
+def _(poolproc,msg,tag=DEFAULT_TAG) :
   rm,wm = poolproc.rwfileno;
   # NOTE: Condition variables are not pickleable and so we have to excise
   #  them from the object before pickling them to send down the line. This
@@ -344,6 +392,44 @@ def _(poolproc,req) :
 def _(poolproc,req) :
   while not messg_stat(poolproc,req) : sleep(TIMEOUT);
   req.msg = loads(req.msg);
+  return req.msg;
+
+# ---------------- MPI Communication primitives ----------------------------
+
+@messg_isend.register(MPIProcessHandle)
+def _(poolproc,msg,tag=DEFAULT_TAG) :
+  req = comm.isend(msg,dest=poolproc.rank,tag=tag);
+  return MPISendRequest(req);
+
+@messg_send.register(MPIProcessHandle)
+def _(poolproc,msg,tag=DEFAULT_TAG) :
+  comm.send(msg,dest=poolproc.rank,tag=tag);
+  return True;
+
+@messg_irecv.register(MPIProcessHandle)
+def _(poolproc,tag=DEFAULT_TAG) :
+  req = comm.irecv(source=poolproc.rank,tag=tag);
+  return MPIRecvRequest(req);
+
+@messg_recv.register(MPIProcessHandle)
+def _(poolproc,tag=DEFAULT_TAG) :
+  data = comm.recv(source=poolproc.rank,tag=tag);
+  return data;
+
+@messg_stat.register(MPIProcessHandle)
+def _(poolproc,req) :
+  if not req.mpireq.ready :
+    return False;
+  if type(req) is MPIRecvRequest :
+    # acquire the communication result message. This should not
+    # block here
+    req.msg = req.mpireq.wait();
+  return True;
+
+@messg_get.register(MPIProcessHandle)
+def _(poolproc,req) :
+  # acquire the result and set msg to it. Then return the message also.
+  req.msg = req.mpireq.wait();
   return req.msg;
 
 # --------------------------------------------------------------------
