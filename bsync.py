@@ -1,7 +1,50 @@
 #!/usr/bin/env python3
 
-# UNTESTED ON MPI
+"""
+  bsync
 
+  A replacement for async.
+
+  Provides MPI thread pool for execution. Based on mpi4py (or equivalent
+  mpi4pylite).
+
+  SYNOPSIS:
+
+    from bsync import *
+    with AsyncPool() as mypool :
+      # call myfunc(i) but on a remote MPI process
+      ms = [mypool.async(myfunc,i,[timeout=1],[priority=0]) for i in range(20)];
+      # [OPTIONAL] block while polling for ready
+      while not all([_.ready() for _ in ms]) : sleep(1);
+      # This will block until everybody is ready even if no ready test is made
+      print([_.get(reraise=True) for _ in ms]);
+
+  Higher priority is given to smaller priority number. Default priority is zero,
+  so if you want *more* priority, use a negative number.
+
+  The reraise keyword defaults to True in which case exceptions in the remote
+  MPI task will be re-raised as exceptions at the .get() method in the
+  controlling process. If you turn reraise=False, then those exceptions
+  will return a ProcException that contains the remote exception ins self.exc.
+
+  There is also a .ready() method to apply to the async() returned object
+  to return a bool test for exec'ed complete.
+
+  If MPI is not available, this module will default to use subprocess pipe/fork
+  instead.
+
+  EXTRAS
+
+    AsyncPool has some keyword options:
+
+      keep_unused=True        unused mpi ranks will drop through AsyncPool so
+                              they can be used for other MPI actions not
+                              involving the thread pool.
+
+    __main__.bsync_use_mpi = False      Turn off MPI and use pipe/fork for
+                                        subprocesses.
+
+"""
 import __main__
 from copy import copy
 from pickle import dumps,loads,HIGHEST_PROTOCOL
@@ -19,7 +62,7 @@ from functools import singledispatch
 
 PICKLE_PROTO = 2;     # pickle protocol to use
 TIMEOUT = 0.001;
-DEFAULT_TAG = -1;
+DEFAULT_TAG = 0;
 ROOT_RANK = 0;        # the controller rank
 MAXPACKETLEN = 1000; #1<<20;
 
@@ -28,9 +71,13 @@ try :
   comm = MPI.COMM_WORLD;
   mpi_rank = comm.Get_rank();
   mpi_size = comm.Get_size();
-  use_mpi = getattr(__main__,'bsync_use_mpi',True);     # default to MPI if succeed
+  if mpi_size > 1 :
+    use_mpi = getattr(__main__,'bsync_use_mpi',True);     # default to MPI if succeed
+  else :
+    use_mpi = False;
 except :
   use_mpi = False;
+
 
 # ========================================================================
 
@@ -48,7 +95,7 @@ class ProcessHandle(ABC) :
     for k,v in args.items() :
       self.__dict__[k] = v;
   @property
-  def rank(self) : return self.rank;
+  def rank(self) : return self._rank;
 
 class ForkProcessHandle(ProcessHandle) :
   def __init__(self,rank,pid,rd,wr) :
@@ -60,11 +107,11 @@ class ForkProcessHandle(ProcessHandle) :
 
 class MPIProcessHandle(ProcessHandle) :
   def __init__(self,rank) :
-    super(MPIProcessHandle,self).__init__(rank=rank);
+    super(MPIProcessHandle,self).__init__(_rank=rank);
 
 class ProcessPool(object) :
   """ the pool of exec child processes """
-  def __init__(self,n=None,tag=DEFAULT_TAG,use_fork=False) :
+  def __init__(self,n=None,tag=DEFAULT_TAG,use_fork=False,**args) :
     """ initialize process pool.
         NOTE: tag is only used in MPI communications, not for forked processes
       __init__
@@ -82,7 +129,7 @@ class ProcessPool(object) :
       # the mpi ranks size *or* the integer value provided whichever is smaller
       if n is None : n = mpi_size;
       if isinstance(n,Integral) :
-        n = range(1,min(n,mpi_size));
+        n = range(1,min(n+1,mpi_size));
       self.using_mpi = True;
 
     # massage n so that it is a list with the ranks, and set the count
@@ -92,7 +139,7 @@ class ProcessPool(object) :
     else :
       self.count = len(n);
 
-    self.forked = False;
+    self.forked = False;        # forked indicates not the root controller process
 
     if not self.using_mpi :      # forked process version
       for i in n :
@@ -109,11 +156,19 @@ class ProcessPool(object) :
           # proc tuple is (rank#, pid, read file descriptor, write file descriptor)
           self.procs.append(ForkProcessHandle(i,getpid(),rm,wm));
           self.unused.append(i);
-    else :        # MPI version
+    else :                          # MPI version
+      self.no_bsync = False;
       if mpi_rank == ROOT_RANK :
+        assert not ROOT_RANK in n,"Can't use root rank as a child mpi task process";
         self.procs = [MPIProcessHandle(_) for _ in n];
+        self.unused = list(range(len(self.procs)));
       else :
-        self.procs = [MPIProcessHandle(ROOT_RANK),];
+        if mpi_rank in n :
+          self.procs = [MPIProcessHandle(ROOT_RANK),];
+          self.forked = True;         # not root controller
+        else :
+          self.no_bsync = True;       # bsync flag indicates unused mpi rank
+          self.forked = True;         # also not root controller (unused process)
 
     self.lock = Lock();       # no need to fork that lock over and over
     self.ack = Condition(Lock());   # acknowledge new proc available
@@ -122,6 +177,8 @@ class ProcessPool(object) :
     exec_loop(self[0]);       # exec_loop runs in child process with only one ProcessHandle
   def get_size(self) :
     return list(range(len(self.procs)));      # list of ranks
+  def get_ranks(self) :
+    return [_.rank for _ in self.procs];
   def get_avail_rank(self) :
     while True :
       n = self.nonblock_get_avail_rank();
@@ -144,9 +201,10 @@ class ProcessPool(object) :
   def __getitem__(self,k) :     # return the proc tuple for rank #k
     return self.procs[k];
   def deleter(self) :
-    if not self.forked :      # only wait for child procs
-      for i in self.procs :
-        if not i is None : wait();
+    if not use_mpi :
+      if not self.forked :      # only wait for child procs
+        for i in self.procs :
+          if not i is None : wait();
     self.forked = True;     # don't do the waiting again if we get here twice
   def __del__(self) :
     self.deleter();
@@ -171,8 +229,13 @@ class AsyncPool(object) :
       self.loader_thread.start();
     else :
       # Run the exec loop in the child process in the event
-      # that the child is a forked process
-      self.pool.run_exec();
+      # that the child is a forked process. For mpi, we may
+      # not use all the ranks and so for those, we exit here.
+      if not use_mpi or not self.pool.no_bsync :
+        self.pool.run_exec();
+      else :
+        if args.get('keep_unused',False) :
+          return;       # allow unused ranks to drop through
       exit(0);
   def async(self,*v,**args) :
     return self.loader.load(*v,**args);
@@ -226,7 +289,28 @@ class MPIRequest(Request) :
     super(MPIRequest,self).__init__(proc,ready=None);
   @property
   def ready(self) :
-    return self.mpireq.test();            # return the test for done
+    """ Returns:
+          bool:       True or False depending on if transaction is complete.
+                      Note that when message is received, req.msg is updated to
+                      include the message. Also note that the behavior of this
+                      is different than for forked pipe processes in which ready
+                      property is literally just a settable bool and does *not*
+                      update the message. The reason for this clumsy arrangement
+                      is that mpi4py returns the message on a test() operation
+                      and then refuses to return the message again if asked,
+                      therefore the message needs to be cached upon the ready
+                      call - but only in mpi mode.
+    """
+    if not self.msg is None :
+      return True;
+    tst = self.mpireq.test();
+    if not tst[0] :             # test for error condition
+      return False;
+    else :
+      if tst[1] :               # test for actual returned message
+        self.msg = tst[1];      # NOTE: None is not a legal message
+        return True;
+      return False;            # return the result now
 
 class MPIRecvRequest(MPIRequest) : pass;
 
@@ -314,6 +398,7 @@ def messg_get(poolproc,req) :
 
 @messg_isend.register(ForkProcessHandle)
 def _(poolproc,msg,tag=DEFAULT_TAG) :
+  assert not msg is None,"Can't send a None message";
   rm,wm = poolproc.rwfileno;
   # NOTE: Condition variables are not pickleable and so we have to excise
   #  them from the object before pickling them to send down the line. This
@@ -325,6 +410,7 @@ def _(poolproc,msg,tag=DEFAULT_TAG) :
 @messg_send.register(ForkProcessHandle)
 def _(poolproc,msg,tag=DEFAULT_TAG) :
   """ blocking send. """
+  assert not msg is None,"Can't send a None message";
   req = messg_isend(poolproc,msg,tag);
   while not req.ready :
     while not messg_stat(poolproc,req) :
@@ -398,18 +484,20 @@ def _(poolproc,req) :
 
 @messg_isend.register(MPIProcessHandle)
 def _(poolproc,msg,tag=DEFAULT_TAG) :
+  assert not msg is None,"Can't send a None message";
   req = comm.isend(msg,dest=poolproc.rank,tag=tag);
-  return MPISendRequest(req);
+  return MPISendRequest(req,poolproc);
 
 @messg_send.register(MPIProcessHandle)
 def _(poolproc,msg,tag=DEFAULT_TAG) :
+  assert not msg is None,"Can't send a None message";
   comm.send(msg,dest=poolproc.rank,tag=tag);
   return True;
 
 @messg_irecv.register(MPIProcessHandle)
 def _(poolproc,tag=DEFAULT_TAG) :
   req = comm.irecv(source=poolproc.rank,tag=tag);
-  return MPIRecvRequest(req);
+  return MPIRecvRequest(req,poolproc);
 
 @messg_recv.register(MPIProcessHandle)
 def _(poolproc,tag=DEFAULT_TAG) :
@@ -418,17 +506,16 @@ def _(poolproc,tag=DEFAULT_TAG) :
 
 @messg_stat.register(MPIProcessHandle)
 def _(poolproc,req) :
-  if not req.mpireq.ready :
-    return False;
-  if type(req) is MPIRecvRequest :
-    # acquire the communication result message. This should not
-    # block here
-    req.msg = req.mpireq.wait();
-  return True;
+  if not req.msg is None :
+    return True;
+  else :
+    return req.ready;
 
 @messg_get.register(MPIProcessHandle)
 def _(poolproc,req) :
   # acquire the result and set msg to it. Then return the message also.
+  if not req.msg is None :
+    return req.msg;
   req.msg = req.mpireq.wait();
   return req.msg;
 
@@ -552,9 +639,9 @@ def comm_loop(pool) :
       if sending :
         toremove = [];
         for s in sending :
-          if s.req is None or not s.req.ready:
+          if s.req is None :
             s.req = messg_isend(pool[s.procno],s,s.tag);
-          s.stat = messg_stat(pool[s.procno],s.req);
+          s.stat = messg_stat(pool[s.procno],s.req) if not use_mpi else True;
           if s.stat :
             if not s.notified :
               with s.cv :
@@ -707,5 +794,5 @@ class Loader(object) :
     self._killed = True;      # indicator that no more tasks will be loaded
 
 __all__ = ["AsyncPool",];
-
+if use_mpi : __all__ += ['mpi_rank','mpi_size'];
 
