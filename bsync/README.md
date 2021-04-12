@@ -1,4 +1,4 @@
-# Bsync
+# bsync
 
 A threadpool library for MPI tasks. It is a python3 compatible and enhanced version of an
 earlier library named async. It uses mpi4py or mpi4pylite as the underlying communication
@@ -32,7 +32,7 @@ of keywords and then call the underlying function from it, e.g. :
 	def myfunc(x,y,mykeywordarg="blah blah") : ...
 
 	def myfunc_wrapper(*v,args_dict) :
-	  return myfunc(*v,**args);
+	  return myfunc(*v,**args_dict);
 
 An alternative to managing the scope of the AsyncPool using `with` blocks is to do the
 deletion manually :
