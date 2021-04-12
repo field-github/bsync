@@ -8,6 +8,8 @@
   Provides MPI thread pool for execution. Based on mpi4py (or equivalent
   mpi4pylite).
 
+  SEE README.md
+
   SYNOPSIS:
 
     from bsync import *
@@ -628,6 +630,7 @@ def comm_loop(pool) :
               with p.cv :
                 if type(p) is RecvMessage :
                   p.msg = messg_get(pool[p.procno],p.req);       # should not block here as msg is ready
+                  if isinstance(p.msg,Message) : p.msg = p.msg.msg;
                 p.notified = True;
                 pool.return_avail_rank(p.procno);
                 p.cv.notify_all();
@@ -723,9 +726,9 @@ class MessageHandle(object) :
     if not self.msg.notified :
       with self.msg.cv :
         self.msg.cv.wait_for(lambda : self.msg.notified);
-    if reraise and isinstance(self.msg.msg.msg,ProcException) :
-      raise self.msg.msg.msg.exc;
-    return self.msg.msg.msg;
+    if reraise and isinstance(self.msg.msg,ProcException) :
+      raise self.msg.msg.exc;
+    return self.msg.msg;
   def queued(self) :
     return hasattr(self.msg);
   def __lt__(self,other) :    # rank based on priority level
