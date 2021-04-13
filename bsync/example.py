@@ -8,7 +8,7 @@ def myfunc(x) :
 #  raise Exception("hell world!");
   return x+2;
 
-with AsyncPool(4) as mypool :
+with AsyncPool() as mypool :
   ms = [mypool.async(myfunc,i) for i in range(20)];
   # optional test ready
   while not all([_.ready() for _ in ms]) : sleep(0.1);

@@ -47,11 +47,13 @@
                                         subprocesses.
 
 """
+
+import sys
 import __main__
 from copy import copy
 from pickle import dumps,loads,HIGHEST_PROTOCOL
 from threading import Thread,Condition,Lock
-from os import open,close,write,read,O_NONBLOCK,pipe,pipe2,fork,getpid,wait
+from os import open,close,write,read,O_NONBLOCK,pipe,pipe2,fork,getpid,wait,popen
 from time import sleep
 from select import select
 from abc import ABC
@@ -111,6 +113,14 @@ class MPIProcessHandle(ProcessHandle) :
   def __init__(self,rank) :
     super(MPIProcessHandle,self).__init__(_rank=rank);
 
+def get_num_cpus() :
+  try :
+    with popen("/usr/bin/nproc") as f :
+      return int(f.readline());
+  except :
+    print("*** can't find nproc to determine number of cpus on node ***",file=sys.stderr);
+  return None;
+
 class ProcessPool(object) :
   """ the pool of exec child processes """
   def __init__(self,n=None,tag=DEFAULT_TAG,use_fork=False,**args) :
@@ -139,12 +149,14 @@ class ProcessPool(object) :
       self.count = n;
       n = range(n);
     else :
+      if not n and not self.using_mpi :
+        n = range(1,get_num_cpus());
       self.count = len(n);
 
     self.forked = False;        # forked indicates not the root controller process
 
     if not self.using_mpi :      # forked process version
-      for i in n :
+      for ii,i in enumerate(n) :
         rs,wm = pipe2(O_NONBLOCK);
         rm,ws = pipe2(O_NONBLOCK);
         pid = fork();
@@ -157,7 +169,7 @@ class ProcessPool(object) :
           close(ws);close(rs);
           # proc tuple is (rank#, pid, read file descriptor, write file descriptor)
           self.procs.append(ForkProcessHandle(i,getpid(),rm,wm));
-          self.unused.append(i);
+          self.unused.append(ii);
     else :                          # MPI version
       self.no_bsync = False;
       if mpi_rank == ROOT_RANK :
@@ -416,7 +428,7 @@ def _(poolproc,msg,tag=DEFAULT_TAG) :
   req = messg_isend(poolproc,msg,tag);
   while not req.ready :
     while not messg_stat(poolproc,req) :
-      sleep(0);
+      sleep(TIMEOUT);
   return True;
 
 @messg_irecv.register(ForkProcessHandle)
@@ -527,13 +539,13 @@ def _(poolproc,req) :
 
 class Message(ABC) :
   """ abstract base class for messages to send or received """
-  def __init__(self,procno,tag=DEFAULT_TAG) :
+  def __init__(self,procno,tag=DEFAULT_TAG,cv=None) :
     self.procno = procno;
     self.tag = tag;
     self.req = None;
     self.raw = None;
     self.notified = False;
-    self.cv = Condition(Lock());      # NOTE: can't be pickled
+    self.cv = cv if cv else Condition(Lock());      # NOTE: can't be pickled
   def __getstate__(self) :      # remove cv property to allow pickling
     d = copy(self.__dict__);
     d['cv'] = None;
@@ -541,8 +553,8 @@ class Message(ABC) :
 
 class RecvMessage(Message) :
   """ a class representing a message to be received """
-  def __init__(self,procno,tag=DEFAULT_TAG) :
-    super(RecvMessage,self).__init__(procno,tag=tag);
+  def __init__(self,procno,tag=DEFAULT_TAG,cv=None) :
+    super(RecvMessage,self).__init__(procno,tag=tag,cv=cv);
 
 class SendMessage(Message) :
   """ a class representing a message to be sent """
@@ -718,14 +730,21 @@ class MessageHandle(object) :
     self.params = v;            # parameters for exec call (f,arg1,arg2,...)
     self.timeout=timeout;       # timeout for remote process (not for sending)
     self.priority = priority;   # priority of this task (lower number is *more* priority
+    self.cv = Condition(Lock());  # This Condition() is forwarded on to the message
   def attach(self,msg) : self.msg = msg;
   def ready(self) :
     return self.msg.notified if hasattr(self,'msg') else False;
   def get(self,reraise=True) :
-    while not hasattr(self,'msg') : sleep(TIMEOUT);
-    if not self.msg.notified :
-      with self.msg.cv :
-        self.msg.cv.wait_for(lambda : self.msg.notified);
+    # NOTE: self.cv is also copied into the message object. We use our
+    #   local handle to self.cv here, but it will be notified in the comm_loop
+    #   by its handle copy in the RecvMessage instance for this task.
+    #   Until this happens, this MessageHandle instance will not have a
+    #   self.msg property, so we have to test for the presence of self.msg
+    #   as well as the notified flag in that self.msg which only appears
+    #   once the task has been sent for execution.
+    if not hasattr(self,'msg') or not self.msg.notified :
+      with self.cv :
+        self.cv.wait_for(lambda : hasattr(self,'msg') and self.msg.notified);
     if reraise and isinstance(self.msg.msg,ProcException) :
       raise self.msg.msg.exc;
     return self.msg.msg;
@@ -788,7 +807,7 @@ class Loader(object) :
         # load the receiver of the return response into the message queue
         with xfer.cv :
           xfer.ack.acquire();       # must release on all circumstances!
-          xfer.msg = RecvMessage(n);
+          xfer.msg = RecvMessage(n,cv=i.cv);
           i.attach(xfer.msg);                  # attach message to MessageHandle
           xfer.cv.notify();
         xfer.ack.wait_for(lambda : (xfer.msg is None));
