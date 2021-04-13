@@ -85,6 +85,13 @@ except :
 
 # ========================================================================
 
+def bsync_using_mpi() : return use_mpi;
+def bsync_get_rank() :
+  if bsync_using_mpi :
+    return mpi_rank;
+  else :
+    return None;
+
 class Xfer :
   """ A class for handing off messages between the loading queue
       (Loader.loading_loop) and the communication loop (comm_loop) """
@@ -190,7 +197,7 @@ class ProcessPool(object) :
   def run_exec(self) :
     exec_loop(self[0]);       # exec_loop runs in child process with only one ProcessHandle
   def get_size(self) :
-    return list(range(len(self.procs)));      # list of ranks
+    return len(self.procs);
   def get_ranks(self) :
     return [_.rank for _ in self.procs];
   def get_avail_rank(self) :
@@ -251,6 +258,7 @@ class AsyncPool(object) :
         if args.get('keep_unused',False) :
           return;       # allow unused ranks to drop through
       exit(0);
+  def get_size(self) : return self.pool.get_size();
   def async(self,*v,**args) :
     return self.loader.load(*v,**args);
   def ischild(self) :
@@ -625,7 +633,7 @@ def comm_loop(pool) :
         elif typ is RecvMessage :
           polling.append(xfer.msg);
         elif typ is KillMessage :
-          for i in pool.get_size() :
+          for i in range(pool.get_size()) :
             # NOTE: perhaps would be better to queue this up in sending list?
             x = copy(xfer.msg);
             messg_send(pool[i],x,x.tag);          # broadcast kill to everyone
@@ -710,7 +718,7 @@ def exec_loop(poolproc,tag=DEFAULT_TAG) :
       timeout = getattr(msg,'timeout',None);
       try :
         try :
-          if timeout : alarm(timeout);
+          if timeout : alarm(int(timeout));
           retval = func(*msg.args);
         except Exception as e :
           retval = ProcException(e);      # send an encapsulated exception
@@ -817,6 +825,79 @@ class Loader(object) :
 
     self._killed = True;      # indicator that no more tasks will be loaded
 
-__all__ = ["AsyncPool",];
+__all__ = ["AsyncPool","bsync_using_mpi","bsync_get_rank"];
 if use_mpi : __all__ += ['mpi_rank','mpi_size'];
+
+def myhellfunc(arg) :
+  return "Hell world, %s!" % arg;
+
+def myrandfunc(a,b,c) :
+  return random((c,c))*b+a;
+
+def mytimeout(t) :
+  sleep(t);
+  return True;
+
+if __name__ == "__main__" :
+  from numpy.random import *
+
+  pool = AsyncPool();
+
+  fprint = lambda *a,**b:print(*a,**b,file=sys.stderr);
+
+  # NOTE: this is kind of annoying. The unittest module can't really
+  # deal with the multiple processes. You need control on entry and
+  # exit of the children and it just isn't setup for that. So, we
+  # try to follow the unittest pattern more or less and do something very
+  # similar here in the event it is ever possible to refactor to use
+  # unittest or some future unittest module.
+
+  class TestBsync() :
+    def assertTrue(self,arg) :
+      assert(arg);
+    def assertFalse(self,arg) :
+      assert(not arg);
+    def test_simple(self) :
+      task = pool.async(myhellfunc,"Jolene");
+      s = task.get();
+      self.assertTrue(s == myhellfunc("Jolene"));
+    def test_random(self) :
+      tasks = [pool.async(myrandfunc,0,10,i) for i in range(10)];
+      for n,t in enumerate(tasks) :
+        x = t.get();
+        self.assertTrue(x.shape == (n,n));
+    def test_timeout(self) :
+      task = pool.async(mytimeout,0.1,timeout=1);
+      self.assertTrue(task.get() == True);
+      try :
+        task = pool.async(mytimeout,2.,timeout=1);
+        self.assertTrue(task.get() == True);
+      except Exception as e :
+        self.assertTrue(isinstance(e,OSError));
+    def test_large(self) :
+      x = [_.get() for _ in [pool.async(myrandfunc,0,10,5) for i in range(1000)]];
+      return True;
+    def test_strfunc(self) :
+      task = pool.async("myhellfunc","Jolene");
+      s = task.get();
+      self.assertTrue(s == myhellfunc("Jolene"));
+    def test_get_cpus(self) :
+      fprint("%d cpus..." % get_num_cpus(),end='');
+  
+  obj = TestBsync();
+  success = fails = 0;
+  for nm,f in TestBsync.__dict__.items() :
+    if nm.startswith("test_") :
+      fprint("Testing %s..." % nm,end='');
+      try :
+        f(obj);
+        fprint("OK");
+        success += 1;
+      except Exception as e :
+        fprint("Failed!\n",str(e));
+        fails += 1;
+  fprint("%d tests succeeded, %d failures" % (success,fails))
+  fprint("Using MPI" if use_mpi else "Using subprocess fork, not MPI");
+
+  del pool;
 

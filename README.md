@@ -98,6 +98,18 @@ variable `bsync_use_mpi` to False :
 	import __main__
 	__main__.bsync_use_mpi = False
 
+### MISCELLANEOUS
+
+`AsyncPool.get_size()` returns the number of tasks in the thread pool.
+`bsync_using_mpi()` returns True if the threadpool is operating in MPI mode.
+`bsync_get_rank()` returns the MPI rank number for this task when called in MPI
+mode. Note that this works either in a task function or in the main controller
+task.
+
+### TESTING
+
+There is a unittest which can be executed by treating the module as a standalone
+executable, e.g. just type `./bsync.py` or `mpirun -np 4 ./bsync.py`
 
 ### GOTCHA
 
