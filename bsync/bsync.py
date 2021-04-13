@@ -427,7 +427,7 @@ def _(poolproc,msg,tag=DEFAULT_TAG) :
   assert not msg is None,"Can't send a None message";
   req = messg_isend(poolproc,msg,tag);
   while not req.ready :
-    while not messg_stat(poolproc,req) :
+    while not messg_stat(poolproc,req,timeout=1) :
       sleep(TIMEOUT);
   return True;
 
@@ -441,7 +441,8 @@ def _(poolproc,tag=DEFAULT_TAG) :
   return messg_get(poolproc,req);
 
 @messg_stat.register(ForkProcessHandle)
-def _(poolproc,req) :
+def _(poolproc,req,timeout=0.) :
+  """ read timeout can be specified if desired. write timeout is always zero for stat """
   assert type(req) in [RecvRequest,SendRequest],\
               "messg_stat received incorrect type %s" % str(type(req));
 
@@ -464,7 +465,7 @@ def _(poolproc,req) :
   else :                              # ===== RECEIVE OPTION
 
     while True :
-      r_rdy,w_rdy,e_rdy = select([FakeFile(rd),],[],[],0.);
+      r_rdy,w_rdy,e_rdy = select([FakeFile(rd),],[],[],timeout);
       if not r_rdy : break;
       # NOTE: We peek at the 8-byte length header before allowing
       #  the read of the rest of the message. In this way, no matter
@@ -490,7 +491,8 @@ def _(poolproc,req) :
 
 @messg_get.register(ForkProcessHandle)
 def _(poolproc,req) :
-  while not messg_stat(poolproc,req) : sleep(TIMEOUT);
+  while not messg_stat(poolproc,req,timeout=1.) :
+    sleep(TIMEOUT);
   req.msg = loads(req.msg);
   return req.msg;
 
