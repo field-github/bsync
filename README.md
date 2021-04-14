@@ -5,22 +5,30 @@ earlier library named async. It uses mpi4py or mpi4pylite as the underlying comm
 engine. Note that all commands and results **must be pickleable** to be sent through the
 stream. (see Gotchas below)
 
+## INSTALL
+
+The normal thing:
+
+	python3 setup.py build
+	python3 setup.py install
+
 ## FEATURES
 
 Works with MPI or subprocess fork tasks when MPI is not available. Timeouts
 and task priorities are new features. AsyncPool class now has __enter__ and __exit__
-properties.
+properties. Communication tags can be specified for MPI. Multiple threadpools can be
+active at one time.
 
 ## SYNOPSIS
 
 Instantiate your AsyncPool object with the number of desired tasks. This may be less than
 the number of total MPI tasks in your job. The AsyncPool object needs to be deleted when
 you're done with it. This happens automatically in the `with` block. The following code
-snipped will remotely call the function `myfunc` and pass it an integer argument from
-0..19.
+snippet will remotely call the function `myfunc` on 4 MPI ranks (using the MPI communicator
+tag 1234) and pass the function `myfunc` an integer argument from 0..19.
 
 	from bsync import *
-	with AsyncPool(4) as mypool :
+	with AsyncPool(4,[tag=1234]) as mypool :
 	  ms = [mypool.async(myfunc,i) for i in range(20)];
 	  print([_.get() for _ in ms]);
 
@@ -97,6 +105,11 @@ variable `bsync_use_mpi` to False :
 
 	import __main__
 	__main__.bsync_use_mpi = False
+
+### EXAMPLES
+
+There are two simple example programs. The second one, `example_twin_pools.py` demonstrates
+the use of two separate threadpools at the same time.
 
 ### MISCELLANEOUS
 

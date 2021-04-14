@@ -53,7 +53,9 @@ import __main__
 from copy import copy
 from pickle import dumps,loads,HIGHEST_PROTOCOL
 from threading import Thread,Condition,Lock
-from os import open,close,write,read,O_NONBLOCK,pipe,pipe2,fork,getpid,wait,popen
+import os
+from os import close,write,read,O_NONBLOCK,pipe,pipe2,fork,\
+                getpid,wait,popen,waitpid
 from time import sleep
 from select import select
 from abc import ABC
@@ -68,7 +70,7 @@ PICKLE_PROTO = 2;     # pickle protocol to use
 TIMEOUT = 0.001;
 DEFAULT_TAG = 0;
 ROOT_RANK = 0;        # the controller rank
-MAXPACKETLEN = 1000; #1<<20;
+MAXPACKETLEN = 1<<24; # maximum chunks to break up messages into
 
 try :
   from mpi4py import MPI
@@ -95,11 +97,12 @@ def bsync_get_rank() :
 class Xfer :
   """ A class for handing off messages between the loading queue
       (Loader.loading_loop) and the communication loop (comm_loop) """
-  def __init__(self) :
+  def __init__(self,tag=DEFAULT_TAG) :
     self._kill = False;
     self.msg = None;
     self.cv = Condition(Lock());
     self.ack = Condition(Lock());
+    self.tag = tag;
 
 class ProcessHandle(ABC) :
   def __init__(self,**args) :
@@ -110,11 +113,11 @@ class ProcessHandle(ABC) :
 
 class ForkProcessHandle(ProcessHandle) :
   def __init__(self,rank,pid,rd,wr) :
-    super(ForkProcessHandle,self).__init__(rank=rank,pid=pid,rd=rd,wr=wr);
+    super(ForkProcessHandle,self).__init__(rank=rank,_pid=pid,rd=rd,wr=wr);
   @property
   def rwfileno(self) : return self.rd,self.wr;
   @property
-  def pid(self) : return self.pid;
+  def pid(self) : return self._pid;
 
 class MPIProcessHandle(ProcessHandle) :
   def __init__(self,rank) :
@@ -142,6 +145,7 @@ class ProcessPool(object) :
     self.unused = [];
     self.used = [];
     self.using_mpi = False;
+    self.xfer = Xfer(tag=tag);      # NOTE: needs tag even in child processes
 
     if use_mpi and not use_fork :
       # use a provided list of ranks if present, otherwise try to size to
@@ -175,7 +179,7 @@ class ProcessPool(object) :
         else :
           close(ws);close(rs);
           # proc tuple is (rank#, pid, read file descriptor, write file descriptor)
-          self.procs.append(ForkProcessHandle(i,getpid(),rm,wm));
+          self.procs.append(ForkProcessHandle(i,pid,rm,wm));
           self.unused.append(ii);
     else :                          # MPI version
       self.no_bsync = False;
@@ -193,9 +197,10 @@ class ProcessPool(object) :
 
     self.lock = Lock();       # no need to fork that lock over and over
     self.ack = Condition(Lock());   # acknowledge new proc available
-    self.xfer = Xfer();
   def run_exec(self) :
-    exec_loop(self[0]);       # exec_loop runs in child process with only one ProcessHandle
+    exec_loop(self[0],self.xfer.tag);       # exec_loop runs in child process with only one ProcessHandle
+    if isinstance(self[0],ForkProcessHandle) :
+      for fd in self[0].rwfileno : close(fd); # close the pipes after done
   def get_size(self) :
     return len(self.procs);
   def get_ranks(self) :
@@ -224,9 +229,11 @@ class ProcessPool(object) :
   def deleter(self) :
     if not use_mpi :
       if not self.forked :      # only wait for child procs
+        self.forked = True;     # don't do the waiting again if we get here twice
         for i in self.procs :
-          if not i is None : wait();
-    self.forked = True;     # don't do the waiting again if we get here twice
+          if not i is None :
+            for fd in i.rwfileno : close(fd);
+            waitpid(i.pid,0);
   def __del__(self) :
     self.deleter();
 
@@ -254,20 +261,31 @@ class AsyncPool(object) :
       # not use all the ranks and so for those, we exit here.
       if not use_mpi or not self.pool.no_bsync :
         self.pool.run_exec();
+        if use_mpi :
+          sys.exit(0)
+        else :
+          os._exit(0);        # no cleanup for child processes in fork
       else :
         if args.get('keep_unused',False) :
-          return;       # allow unused ranks to drop through
-      exit(0);
-  def get_size(self) : return self.pool.get_size();
+          return;       # allow unused ranks to drop through back to user control
+      sys.exit(0);              # normal python exit for MPI
+  def get_size(self) :
+    return self.pool.get_size();
   def async(self,*v,**args) :
     return self.loader.load(*v,**args);
   def ischild(self) :
-    return self.pool.forked;
-  def deleter(self) :
+    """ test to see if this process is a task executing child process.
+      Returns:
+        bool:           True if a child process
+        None:           if the ProcessPool has already been deleted in
+                        final program exit
+    """
     try :
-      ch = self.ischild();
-    except : return;
-    if not ch :
+      return self.pool.forked;
+    except :
+      return None;
+  def deleter(self) :
+    if self.ischild() == False :   # None is a possible case (on final deletion) too
       self.loader.kill();
       with self.pool.xfer.cv :
         self.pool.xfer.msg = KillMessage();
@@ -549,9 +567,8 @@ def _(poolproc,req) :
 
 class Message(ABC) :
   """ abstract base class for messages to send or received """
-  def __init__(self,procno,tag=DEFAULT_TAG,cv=None) :
+  def __init__(self,procno,cv=None) :
     self.procno = procno;
-    self.tag = tag;
     self.req = None;
     self.raw = None;
     self.notified = False;
@@ -563,14 +580,14 @@ class Message(ABC) :
 
 class RecvMessage(Message) :
   """ a class representing a message to be received """
-  def __init__(self,procno,tag=DEFAULT_TAG,cv=None) :
-    super(RecvMessage,self).__init__(procno,tag=tag,cv=cv);
+  def __init__(self,procno,cv=None) :
+    super(RecvMessage,self).__init__(procno,cv=cv);
 
 class SendMessage(Message) :
   """ a class representing a message to be sent """
-  def __init__(self,procno,msg,tag=DEFAULT_TAG) :
+  def __init__(self,procno,msg) :
     self.msg = msg;
-    super(SendMessage,self).__init__(procno,tag=tag);
+    super(SendMessage,self).__init__(procno);
   @property
   def func(self) : return self.msg[0];
   @property
@@ -578,19 +595,19 @@ class SendMessage(Message) :
 
 class ReturnMessage(Message) :
   """ a class for returning results from the exec_loop """
-  def __init__(self,procno,msg,tag=DEFAULT_TAG) :
+  def __init__(self,procno,msg) :
     self.msg = msg;
-    super(ReturnMessage,self).__init__(procno,tag);
+    super(ReturnMessage,self).__init__(procno);
 
 class ExecMessage(SendMessage) :
   """ a class for making execute requests of the exec_loop """
-  def __init__(self,procno,f,*args,tag=DEFAULT_TAG,timeout=None) :
+  def __init__(self,procno,f,*args,timeout=None) :
     try :
       dumps(f,protocol=PICKLE_PROTO);
     except :
       f = "__main__.%s.__name__" % f.__name__;
     self.timeout = timeout;
-    super(ExecMessage,self).__init__(procno,(f,)+args,tag);
+    super(ExecMessage,self).__init__(procno,(f,)+args);
 
 class KillMessage(Message) :
   """ a class indicating the exec_loop should shut down and exit """
@@ -636,7 +653,7 @@ def comm_loop(pool) :
           for i in range(pool.get_size()) :
             # NOTE: perhaps would be better to queue this up in sending list?
             x = copy(xfer.msg);
-            messg_send(pool[i],x,x.tag);          # broadcast kill to everyone
+            messg_send(pool[i],x,xfer.tag);          # broadcast kill to everyone
           break;
 
       xfer.msg = None;  # OK, got this message so clear it for next one
@@ -645,7 +662,7 @@ def comm_loop(pool) :
         toremove = [];  # list of connections to drop from the polling list
         for p in polling :
           if p.req is None :
-            p.req = messg_irecv(pool[p.procno],p.tag);
+            p.req = messg_irecv(pool[p.procno],xfer.tag);
           p.stat = messg_stat(pool[p.procno],p.req);
           if p.stat :
             if not p.notified :
@@ -665,7 +682,7 @@ def comm_loop(pool) :
         toremove = [];
         for s in sending :
           if s.req is None :
-            s.req = messg_isend(pool[s.procno],s,s.tag);
+            s.req = messg_isend(pool[s.procno],s,xfer.tag);
           s.stat = messg_stat(pool[s.procno],s.req) if not use_mpi else True;
           if s.stat :
             if not s.notified :
@@ -732,7 +749,7 @@ def exec_loop(poolproc,tag=DEFAULT_TAG) :
         retval = Exception("Alarm timeout race in exec_loop");
       finally :
         if timeout : alarm(0);
-      messg_send(poolproc,ReturnMessage(None,retval,tag),tag);    # NOTE: rank is unused here
+      messg_send(poolproc,ReturnMessage(None,retval),tag);    # NOTE: rank is unused here
       del retval,func;
 
 class MessageHandle(object) :
@@ -841,7 +858,11 @@ def mytimeout(t) :
 if __name__ == "__main__" :
   from numpy.random import *
 
-  pool = AsyncPool();
+  try :
+    cpus = get_num_cpus()-1;
+  except :
+    cpus = None;
+  pool = AsyncPool(cpus);
 
   fprint = lambda *a,**b:print(*a,**b,file=sys.stderr);
 
@@ -883,6 +904,12 @@ if __name__ == "__main__" :
       self.assertTrue(s == myhellfunc("Jolene"));
     def test_get_cpus(self) :
       fprint("%d cpus..." % get_num_cpus(),end='');
+    def test_multiple_pools(self) :
+      """ test having multiple pools open at one time """
+      if not use_mpi or not cpus is None :
+        pool2 = AsyncPool(1);
+        jobs = [_.get() for _ in [pool2.async(myhellfunc,j) for j in range(5)]];
+        del pool2;
   
   obj = TestBsync();
   success = fails = 0;
@@ -897,7 +924,8 @@ if __name__ == "__main__" :
         fprint("Failed!\n",str(e));
         fails += 1;
   fprint("%d tests succeeded, %d failures" % (success,fails))
-  fprint("Using MPI" if use_mpi else "Using subprocess fork, not MPI");
+  fprint("Using MPI with %d+1 ranks" % cpus \
+      if use_mpi else "Using subprocess fork, not MPI");
 
   del pool;
 

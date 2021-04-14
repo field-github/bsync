@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 
+""" simple example program for bsync showing how to use the MPI
+    threadpool. In this case, we wrap the threadpool using a 'with'
+    block, but you can also arrange to delete the threadpool
+    manually. See README.md
+"""
+
 from bsync import *
 from time import sleep
 from os import getpid
@@ -20,12 +26,20 @@ def myfunc(x,sz) :
   s += " out of %d tasks" % sz;
   return s;
 
+
+# create the threadpool with as many cpus as are available
 with AsyncPool() as mypool :
-  ms = [mypool.async(myfunc,i,mypool.get_size()) for i in range(10)];
-  # optional test ready
+  tasks = [mypool.async(myfunc,i,mypool.get_size()) for i in range(10)];
+  # optional test for all tasks complete
   while not all([_.ready() for _ in ms]) : sleep(0.1);
-  # blocks at each task if not ready
+  # since we've tested for all ready, this loop will not block.
+  # if the polling loop above is removed, then this print statement
+  # will block one by one until each task is completed
   for i in ms :
     print(i.get());
-  # alternative is [_.get() for _ in ms] to capture all
+
+  # an alternative for acquiring all the tasks is to use a
+  # comprehension like [_.get() for _ in ms]
+
+# deletion of threadpool is automatic here in 'with' block.
 
