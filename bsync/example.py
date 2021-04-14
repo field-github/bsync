@@ -31,11 +31,11 @@ def myfunc(x,sz) :
 with AsyncPool() as mypool :
   tasks = [mypool.async(myfunc,i,mypool.get_size()) for i in range(10)];
   # optional test for all tasks complete
-  while not all([_.ready() for _ in ms]) : sleep(0.1);
+  while not all([_.ready() for _ in tasks]) : sleep(0.1);
   # since we've tested for all ready, this loop will not block.
   # if the polling loop above is removed, then this print statement
   # will block one by one until each task is completed
-  for i in ms :
+  for i in tasks :
     print(i.get());
 
   # an alternative for acquiring all the tasks is to use a
