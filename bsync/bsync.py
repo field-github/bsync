@@ -72,6 +72,7 @@ DEFAULT_TAG = 0;
 ROOT_RANK = 0;        # the controller rank
 MAXPACKETLEN = 1<<24; # maximum chunks to break up messages into
 
+# Some dumb logic to try and figure out whether to use MPI by default
 try :
   from mpi4py import MPI
   comm = MPI.COMM_WORLD;
@@ -87,8 +88,12 @@ except :
 
 # ========================================================================
 
-def bsync_using_mpi() : return use_mpi;
+def bsync_using_mpi() :
+  """ return True if operating in MPI mode """
+  return use_mpi;
+
 def bsync_get_rank() :
+  """ return the MPI rank (if using MPI) """
   if bsync_using_mpi :
     return mpi_rank;
   else :
@@ -105,6 +110,7 @@ class Xfer :
     self.tag = tag;
 
 class ProcessHandle(ABC) :
+  """ A class that describes a slave task - either MPI or Forked subclasses """
   def __init__(self,**args) :
     for k,v in args.items() :
       self.__dict__[k] = v;
@@ -115,15 +121,16 @@ class ForkProcessHandle(ProcessHandle) :
   def __init__(self,rank,pid,rd,wr) :
     super(ForkProcessHandle,self).__init__(rank=rank,_pid=pid,rd=rd,wr=wr);
   @property
-  def rwfileno(self) : return self.rd,self.wr;
+  def rwfileno(self) : return self.rd,self.wr;      # file descriptors for r,w pipes
   @property
-  def pid(self) : return self._pid;
+  def pid(self) : return self._pid;     # PID of the slave task
 
 class MPIProcessHandle(ProcessHandle) :
   def __init__(self,rank) :
     super(MPIProcessHandle,self).__init__(_rank=rank);
 
 def get_num_cpus() :
+  """ Return number of cpus on the machine for default forking operation """
   try :
     with popen("/usr/bin/nproc") as f :
       return int(f.readline());
@@ -139,66 +146,81 @@ class ProcessPool(object) :
       __init__
         Args:
           n(int or list/tuple):       number of processes OR list of ranks to use
+                                      If a list, then a None element indicates a
+                                      forked subprocess. So it is possible to
+                                      mix fork and MPI processes.
           tag(int):                   MPI tag to use in communications
     """
     self.procs = [];
     self.unused = [];
     self.used = [];
-    self.using_mpi = False;
     self.xfer = Xfer(tag=tag);      # NOTE: needs tag even in child processes
+    # these two flags indicate whether this is MPI, whether a subprocess and whether
+    # there should *not* be a exec_loop run for the task
+    self.using_mpi = False;
+    self._ischild = False;
+    self.no_bsync = False;
 
-    if use_mpi and not use_fork :
-      # use a provided list of ranks if present, otherwise try to size to
-      # the mpi ranks size *or* the integer value provided whichever is smaller
-      if n is None : n = mpi_size;
+    # this flag specifies whether we are MPI enabled
+    # if not, *all* processes will be forked. Also,
+    # using_mpi does *not* indicate that *any* mpi ranks will
+    # actually be assigned to exec slave tasks
+    self.using_mpi = use_mpi and not use_fork;
+
+    # do some massaging of the n argument to make it into a list of integers
+    if self.using_mpi :
+      if n is None : n = mpi_size-1;
       if isinstance(n,Integral) :
-        n = range(1,min(n+1,mpi_size));
-      self.using_mpi = True;
+        n = range(1,min(n+1,mpi_size));     # all remaining ranks (or n)
+    else :   # not MPI
+      ncpu = get_num_cpus();
+      if n is None : n = ncpu-1;
+      if isinstance(n,Integral) :
+        n = range(1,min(n+1,ncpu));     # all remaining ranks (or n)
 
-    # massage n so that it is a list with the ranks, and set the count
-    if isinstance(n,Integral) :
-      self.count = n;
-      n = range(n);
-    else :
-      if not n and not self.using_mpi :
-        n = range(1,get_num_cpus());
-      self.count = len(n);
+    # the number of subprocesses total
+    self.count = len(n);
+    self.unused = [_ for _ in range(self.count)];
 
-    self.forked = False;        # forked indicates not the root controller process
+    if self.using_mpi and mpi_rank == ROOT_RANK :
+      assert not ROOT_RANK in n,"Can't use root rank as a child mpi task process";
+      self.procs = [MPIProcessHandle(_) for _ in n if not _ is None];
 
-    if not self.using_mpi :      # forked process version
-      for ii,i in enumerate(n) :
-        rs,wm = pipe2(O_NONBLOCK);
-        rm,ws = pipe2(O_NONBLOCK);
-        pid = fork();
-        if not pid :
-          close(wm);close(rm);
-          self.procs = [ForkProcessHandle(ROOT_RANK,getpid(),rs,ws),];
-          self.forked = True;
-          return;
-        else :
-          close(ws);close(rs);
-          # proc tuple is (rank#, pid, read file descriptor, write file descriptor)
-          self.procs.append(ForkProcessHandle(i,pid,rm,wm));
-          self.unused.append(ii);
-    else :                          # MPI version
-      self.no_bsync = False;
-      if mpi_rank == ROOT_RANK :
-        assert not ROOT_RANK in n,"Can't use root rank as a child mpi task process";
-        self.procs = [MPIProcessHandle(_) for _ in n];
-        self.unused = list(range(len(self.procs)));
-      else :
-        if mpi_rank in n :
+    # mark all the unallocated task ranks as such
+    if self.using_mpi and mpi_rank != ROOT_RANK :
+      if not mpi_rank in n :
+        self.no_bsync = True;
+        self._ischild = True;
+
+    for ii,i in enumerate(n) :
+      if not self.using_mpi or mpi_rank == ROOT_RANK :
+        if not self.using_mpi or i is None :    # need to fork a subprocess
+          rs,wm = pipe2(O_NONBLOCK);
+          rm,ws = pipe2(O_NONBLOCK);
+          pid = fork();
+          if not pid :
+            close(wm);close(rm);
+            self.procs = [ForkProcessHandle(ROOT_RANK,getpid(),rs,ws),];
+            self._ischild = True;
+            return;
+          else :
+            close(ws);close(rs);
+            self.procs.append(ForkProcessHandle(i,pid,rm,wm));
+      else :      # use MPI for this task
+        if mpi_rank != ROOT_RANK and i == mpi_rank :
+          self._ischild = True;
           self.procs = [MPIProcessHandle(ROOT_RANK),];
-          self.forked = True;         # not root controller
-        else :
-          self.no_bsync = True;       # bsync flag indicates unused mpi rank
-          self.forked = True;         # also not root controller (unused process)
+          self.no_bsync = False;
 
-    self.lock = Lock();       # no need to fork that lock over and over
-    self.ack = Condition(Lock());   # acknowledge new proc available
+    # NOTE: no need to make these for the subprocesses
+    if not self._ischild :
+      self.lock = Lock();             # no need to fork that lock over and over
+      self.ack = Condition(Lock());   # acknowledge new proc available
+
+    return;                           # end __init__
+
   def run_exec(self) :
-    exec_loop(self[0],self.xfer.tag);       # exec_loop runs in child process with only one ProcessHandle
+    exec_loop(self[0],self.xfer.tag);         # exec_loop runs in child process with only one ProcessHandle
     if isinstance(self[0],ForkProcessHandle) :
       for fd in self[0].rwfileno : close(fd); # close the pipes after done
   def get_size(self) :
@@ -227,13 +249,12 @@ class ProcessPool(object) :
   def __getitem__(self,k) :     # return the proc tuple for rank #k
     return self.procs[k];
   def deleter(self) :
-    if not use_mpi :
-      if not self.forked :      # only wait for child procs
-        self.forked = True;     # don't do the waiting again if we get here twice
-        for i in self.procs :
-          if not i is None :
-            for fd in i.rwfileno : close(fd);
-            waitpid(i.pid,0);
+    if not self._ischild :      # only wait for child procs
+      self._ischild = True;     # don't do the waiting again if we get here twice
+      for i in self.procs :
+        if isinstance(i,ForkProcessHandle) :
+          for fd in i.rwfileno : close(fd);
+          waitpid(i.pid,0);
   def __del__(self) :
     self.deleter();
 
@@ -259,16 +280,13 @@ class AsyncPool(object) :
       # Run the exec loop in the child process in the event
       # that the child is a forked process. For mpi, we may
       # not use all the ranks and so for those, we exit here.
-      if not use_mpi or not self.pool.no_bsync :
+      if not self.pool.no_bsync :
         self.pool.run_exec();
-        if use_mpi :
-          sys.exit(0)
-        else :
-          os._exit(0);        # no cleanup for child processes in fork
+        sys.exit(0) if isinstance(self.pool[0],MPIProcessHandle) else os._exit(0);
       else :
-        if args.get('keep_unused',False) :
+        if args.get('keep_unused',False) :      # drop through rank for this one
           return;       # allow unused ranks to drop through back to user control
-      sys.exit(0);              # normal python exit for MPI
+      sys.exit(0);              # normal python exit for MPI (unused rank)
   def get_size(self) :
     return self.pool.get_size();
   def async(self,*v,**args) :
@@ -281,7 +299,7 @@ class AsyncPool(object) :
                         final program exit
     """
     try :
-      return self.pool.forked;
+      return self.pool._ischild;
     except :
       return None;
   def deleter(self) :
@@ -548,10 +566,7 @@ def _(poolproc,tag=DEFAULT_TAG) :
 
 @messg_stat.register(MPIProcessHandle)
 def _(poolproc,req) :
-  if not req.msg is None :
-    return True;
-  else :
-    return req.ready;
+  return req.ready;
 
 @messg_get.register(MPIProcessHandle)
 def _(poolproc,req) :
@@ -683,7 +698,9 @@ def comm_loop(pool) :
         for s in sending :
           if s.req is None :
             s.req = messg_isend(pool[s.procno],s,xfer.tag);
-          s.stat = messg_stat(pool[s.procno],s.req) if not use_mpi else True;
+          # NOTE: for MPI, we assume an isend is on its way, no need to poll
+          s.stat = messg_stat(pool[s.procno],s.req) \
+                        if isinstance(pool[s.procno],ForkProcessHandle) else True;
           if s.stat :
             if not s.notified :
               with s.cv :

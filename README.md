@@ -17,7 +17,10 @@ The normal thing:
 Works with MPI or subprocess fork tasks when MPI is not available. Timeouts
 and task priorities are new features. AsyncPool class now has __enter__ and __exit__
 properties. Communication tags can be specified for MPI. Multiple threadpools can be
-active at one time.
+active at one time and it is possible to make mixed threadpools that have *both* MPI and
+forked subprocesses. The individual MPI ranks can be specified and not all ranks
+need to be used for the task execution. Tags can be specified for the communications
+so that backchannel communications can be used with different tags.
 
 ## SYNOPSIS
 
@@ -106,9 +109,23 @@ variable `bsync_use_mpi` to False :
 	import __main__
 	__main__.bsync_use_mpi = False
 
+### MIXED MPI/FORK PROCESS POOLS
+
+It is possible to mix tasks between MPI and forked subprocesses. See the example program
+`example_mixed.py`.  This is done by specifying a list for the AsyncPool constructor.
+Elements of the list are either integer rank numbers or `None` for a requested forked
+subprocess, e.g.
+
+	# use ranks 1,2,3 and three forked subprocesses
+	with AsyncPool([None,1,2,3,None,None]) as mypool :
+	  ...
+
+No distinction is made between the subprocesses in terms of where tasks will be
+submitted.
+
 ### EXAMPLES
 
-There are two simple example programs. The second one, `example_twin_pools.py` demonstrates
+There are three simple example programs. The second one, `example_twin_pools.py` demonstrates
 the use of two separate threadpools at the same time.
 
 ### MISCELLANEOUS
