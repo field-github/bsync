@@ -76,18 +76,19 @@ be the next one submitted for execution (e.g. as soon as a MPI task becomes avai
 ## EXCEPTIONS
 
 Exceptions that occur in the remote processes are returned through the MPI communication
-and will by default raise in the master process. This behavior can be changed by setting
-the `reraise=False` in the `get` method :
+and will by default raise in the master process :
 
 	job = mypool.async(myfunc,"hello world!");
 	try :
-	  result = job.get(reraise=False);
-	except ProcException as e :
-	  print("Ooops! myfunc caused an exception %s" % str(e.exc));
+	  result = job.get();
+	except Exception as e :
+	  print("Ooops! myfunc caused an exception %s" % str(e));
 
-Note that the `ready` method will not raise an exception coming from the underlying polled
-task. That only happens from the `get` method and so it is not necessary to wrap the
-`ready` test inside of a `try...catch` block
+This behavior can be changed by setting the `reraise=False` keyword arg in the `get`
+method in which case the return value will be a ProcException whose property `e.exc` will
+be the exception that was actually thrown.  Note that the `ready` method will not raise an
+exception coming from the underlying polled task. That only happens from the `get` method
+and so it is not necessary to wrap the `ready` test inside of a `try...catch` block
 
 ## OPERATION WITH/WITHOUT MPI
 

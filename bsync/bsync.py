@@ -132,10 +132,14 @@ class MPIProcessHandle(ProcessHandle) :
 def get_num_cpus() :
   """ Return number of cpus on the machine for default forking operation """
   try :
-    with popen("/usr/bin/nproc") as f :
+    with popen("/usr/bin/nproc") as f :   # POSIX command for number of cores
       return int(f.readline());
   except :
-    print("*** can't find nproc to determine number of cpus on node ***",file=sys.stderr);
+    try :   # MAC OS X equivalent of nproc command
+      with popen("/usr/sbin/sysctl -n hw.logicalcpu") as f :
+        return int(f.readline());
+    except :
+      print("*** can't find nproc to determine number of cpus on node ***",file=sys.stderr);
   return None;
 
 class ProcessPool(object) :
