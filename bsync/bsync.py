@@ -140,7 +140,8 @@ def get_num_cpus() :
         return int(f.readline());
     except :
       print("*** can't find nproc to determine number of cpus on node ***",file=sys.stderr);
-  return None;
+  print("*** going to return 4 cpus since I have no idea how many is right ***");
+  return 4;
 
 class ProcessPool(object) :
   """ the pool of exec child processes """
@@ -878,14 +879,13 @@ def mytimeout(t) :
 
 if __name__ == "__main__" :
   from numpy.random import *
+  
+  fprint = lambda *a,**b:print(*a,**b,file=sys.stderr);
 
-  try :
-    cpus = get_num_cpus()-1;
-  except :
-    cpus = None;
+  cpus = get_num_cpus()-1;
+
   pool = AsyncPool(cpus);
 
-  fprint = lambda *a,**b:print(*a,**b,file=sys.stderr);
 
   # NOTE: this is kind of annoying. The unittest module can't really
   # deal with the multiple processes. You need control on entry and
