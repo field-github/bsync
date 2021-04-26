@@ -58,8 +58,8 @@ import os
 #                 getpid,wait,popen,waitpid
 from os import close,write,read,O_NONBLOCK,pipe,fork,\
                 getpid,wait,popen,waitpid
+from fcntl import fcntl,F_SETFD
 from time import sleep
-from fcntl import fcntl, F_SETFD
 from select import select
 from abc import ABC
 from struct import pack,unpack
@@ -143,7 +143,8 @@ def get_num_cpus() :
         return int(f.readline());
     except :
       print("*** can't find nproc to determine number of cpus on node ***",file=sys.stderr);
-  return None;
+  print("*** going to return 4 cpus since I have no idea how many is right ***");
+  return 4;
 
 class ProcessPool(object) :
   """ the pool of exec child processes """
@@ -202,8 +203,6 @@ class ProcessPool(object) :
     for ii,i in enumerate(n) :
       if not self.using_mpi or mpi_rank == ROOT_RANK :
         if not self.using_mpi or i is None :    # need to fork a subprocess
-          # rs,wm = pipe2(O_NONBLOCK);
-          # rm,ws = pipe2(O_NONBLOCK);
           rs,wm = pipe();
           rm,ws = pipe();
           for fd in [rs,wm,rm,ws] : fcntl(fd,F_SETFD,O_NONBLOCK);
@@ -884,14 +883,13 @@ def mytimeout(t) :
 
 if __name__ == "__main__" :
   from numpy.random import *
+  
+  fprint = lambda *a,**b:print(*a,**b,file=sys.stderr);
 
-  try :
-    cpus = get_num_cpus()-1;
-  except :
-    cpus = None;
+  cpus = get_num_cpus()-1;
+
   pool = AsyncPool(cpus);
 
-  fprint = lambda *a,**b:print(*a,**b,file=sys.stderr);
 
   # NOTE: this is kind of annoying. The unittest module can't really
   # deal with the multiple processes. You need control on entry and
