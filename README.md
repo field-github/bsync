@@ -32,11 +32,11 @@ tag 1234) and pass the function `myfunc` an integer argument from 0..19.
 
 	from bsync import *
 	with AsyncPool(4,[tag=1234]) as mypool :
-	  ms = [mypool.async(myfunc,i) for i in range(20)];
+	  ms = [mypool.bsync(myfunc,i) for i in range(20)];
 	  print([_.get() for _ in ms]);
 
-The `async` method can take a variable arglist of position arguments. Because of the
-problem of collision in keyword arguments between the `async` method and the function to
+The `bsync` method can take a variable arglist of position arguments. Because of the
+problem of collision in keyword arguments between the `bsync` method and the function to
 be called, if you need to pass keyword args just write a wrapper function to accept a dict
 of keywords and then call the underlying function from it, e.g. :
 
@@ -50,23 +50,23 @@ deletion manually :
 
 	from bsync import *
 	mypool = AsyncPool(4);
-	ms = [mypool.async(myfunc,i) for i in range(20)];
+	ms = [mypool.bsync(myfunc,i) for i in range(20)];
 	print([_.get() for _ in ms]);
 	del mypool;
 
-The `AsyncPool.async` method returns a `MessageHandle` object which has both `get` and
+The `AsyncPool.bsync` method returns a `MessageHandle` object which has both `get` and
 `ready` methods. The `get` method blocks until the gotten task returns its result. The
 `ready` method is a non-blocking poll to test whether a result has been returned.
 	
 	with AsyncPool(4) as mypool :
-	  ms = [mypool.async(myfunc,i) for i in range(20)];
+	  ms = [mypool.bsync(myfunc,i) for i in range(20)];
 	  # poll until all jobs ready
 	  while not all([_.ready() for _ in ms]) : sleep(1);
 	  print([_.get() for _ in ms]);		# will not block here
 
-Timeouts and priority can be added to the task request created by the `async` method :
+Timeouts and priority can be added to the task request created by the `bsync` method :
 
-	job = mypool.async(myfunc,i,timeout=3,priority=-2)
+	job = mypool.bsync(myfunc,i,timeout=3,priority=-2)
 
 In this case, there will be a 3 second timeout for the function to complete. The default
 priority is zero; more negative priority is **higher** priority. So, if many tasks are
@@ -78,7 +78,7 @@ be the next one submitted for execution (e.g. as soon as a MPI task becomes avai
 Exceptions that occur in the remote processes are returned through the MPI communication
 and will by default raise in the master process :
 
-	job = mypool.async(myfunc,"hello world!");
+	job = mypool.bsync(myfunc,"hello world!");
 	try :
 	  result = job.get();
 	except Exception as e :
@@ -146,13 +146,13 @@ executable, e.g. just type `./bsync.py` or `mpirun -np 4 ./bsync.py`
 
 Python has limitations on the ability to pickle function objects. You may have functions
 which are not pickleable (e.g. contain unpickleable code) and for this, you can substitute
-the raw function object in async for the name of the function, e.g.
+the raw function object in bsync for the name of the function, e.g.
 
-	task = mypool.async("myfunc",i);
+	task = mypool.bsync("myfunc",i);
 
 instead of 
 
-	task = mypool.async(myfunc,i);
+	task = mypool.bsync(myfunc,i);
 
 when the task controller receives a string instead of a function object, it will eval the
 string and then attempt to call the (hopefully) resulting function object.
