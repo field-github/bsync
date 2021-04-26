@@ -56,6 +56,7 @@ from threading import Thread,Condition,Lock
 import os
 from os import close,write,read,O_NONBLOCK,pipe,pipe2,fork,\
                 getpid,wait,popen,waitpid
+from fcntl import fcntl,F_SETFD
 from time import sleep
 from select import select
 from abc import ABC
@@ -200,8 +201,9 @@ class ProcessPool(object) :
     for ii,i in enumerate(n) :
       if not self.using_mpi or mpi_rank == ROOT_RANK :
         if not self.using_mpi or i is None :    # need to fork a subprocess
-          rs,wm = pipe2(O_NONBLOCK);
-          rm,ws = pipe2(O_NONBLOCK);
+          rs,wm = pipe();
+          rm,ws = pipe();
+          for fd in [rs,wm,rm,ws] : fcntl(fd,F_SETFD,O_NONBLOCK);
           pid = fork();
           if not pid :
             close(wm);close(rm);
