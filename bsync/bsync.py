@@ -15,7 +15,7 @@
     from bsync import *
     with AsyncPool() as mypool :
       # call myfunc(i) but on a remote MPI process
-      ms = [mypool.async(myfunc,i,[timeout=1],[priority=0]) for i in range(20)];
+      ms = [mypool.bsync(myfunc,i,[timeout=1],[priority=0]) for i in range(20)];
       # [OPTIONAL] block while polling for ready
       while not all([_.ready() for _ in ms]) : sleep(1);
       # This will block until everybody is ready even if no ready test is made
@@ -29,7 +29,7 @@
   controlling process. If you turn reraise=False, then those exceptions
   will return a ProcException that contains the remote exception ins self.exc.
 
-  There is also a .ready() method to apply to the async() returned object
+  There is also a .ready() method to apply to the bsync() returned object
   to return a bool test for exec'ed complete.
 
   If MPI is not available, this module will default to use subprocess pipe/fork
@@ -54,7 +54,9 @@ from copy import copy
 from pickle import dumps,loads,HIGHEST_PROTOCOL
 from threading import Thread,Condition,Lock
 import os
-from os import close,write,read,O_NONBLOCK,pipe,pipe2,fork,\
+# from os import close,write,read,O_NONBLOCK,pipe,pipe2,fork,\
+#                 getpid,wait,popen,waitpid
+from os import close,write,read,O_NONBLOCK,pipe,fork,\
                 getpid,wait,popen,waitpid
 from fcntl import fcntl,F_SETFD
 from time import sleep
@@ -296,7 +298,7 @@ class AsyncPool(object) :
       sys.exit(0);              # normal python exit for MPI (unused rank)
   def get_size(self) :
     return self.pool.get_size();
-  def async(self,*v,**args) :
+  def bsync(self,*v,**args) :
     return self.loader.load(*v,**args);
   def ischild(self) :
     """ test to see if this process is a task executing child process.
@@ -902,27 +904,27 @@ if __name__ == "__main__" :
     def assertFalse(self,arg) :
       assert(not arg);
     def test_simple(self) :
-      task = pool.async(myhellfunc,"Jolene");
+      task = pool.bsync(myhellfunc,"Jolene");
       s = task.get();
       self.assertTrue(s == myhellfunc("Jolene"));
     def test_random(self) :
-      tasks = [pool.async(myrandfunc,0,10,i) for i in range(10)];
+      tasks = [pool.bsync(myrandfunc,0,10,i) for i in range(10)];
       for n,t in enumerate(tasks) :
         x = t.get();
         self.assertTrue(x.shape == (n,n));
     def test_timeout(self) :
-      task = pool.async(mytimeout,0.1,timeout=1);
+      task = pool.bsync(mytimeout,0.1,timeout=1);
       self.assertTrue(task.get() == True);
       try :
-        task = pool.async(mytimeout,2.,timeout=1);
+        task = pool.bsync(mytimeout,2.,timeout=1);
         self.assertTrue(task.get() == True);
       except Exception as e :
         self.assertTrue(isinstance(e,OSError));
     def test_large(self) :
-      x = [_.get() for _ in [pool.async(myrandfunc,0,10,5) for i in range(1000)]];
+      x = [_.get() for _ in [pool.bsync(myrandfunc,0,10,5) for i in range(1000)]];
       return True;
     def test_strfunc(self) :
-      task = pool.async("myhellfunc","Jolene");
+      task = pool.bsync("myhellfunc","Jolene");
       s = task.get();
       self.assertTrue(s == myhellfunc("Jolene"));
     def test_get_cpus(self) :
@@ -931,7 +933,7 @@ if __name__ == "__main__" :
       """ test having multiple pools open at one time """
       if not use_mpi or not cpus is None :
         pool2 = AsyncPool(1);
-        jobs = [_.get() for _ in [pool2.async(myhellfunc,j) for j in range(5)]];
+        jobs = [_.get() for _ in [pool2.bsync(myhellfunc,j) for j in range(5)]];
         del pool2;
   
   obj = TestBsync();
