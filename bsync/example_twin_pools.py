@@ -34,8 +34,8 @@ pool1 = AsyncPool([1,2,3],tag=100);
 pool2 = AsyncPool([3,],tag=101);
 
 # quaue up some jobs in both pools
-jobs1 = [pool1.async(myfunc,i,1) for i in range(5)];
-jobs2 = [pool1.async(myfunc,i,2) for i in range(5)];
+jobs1 = [pool1.bsync(myfunc,i,1) for i in range(5)];
+jobs2 = [pool1.bsync(myfunc,i,2) for i in range(5)];
 
 # wait for everybody to get donw
 while not all([_.ready() for _ in jobs1]) and \

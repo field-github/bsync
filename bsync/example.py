@@ -29,7 +29,7 @@ def myfunc(x,sz) :
 
 # create the threadpool with as many cpus as are available
 with AsyncPool() as mypool :
-  tasks = [mypool.async(myfunc,i,mypool.get_size()) for i in range(10)];
+  tasks = [mypool.bsync(myfunc,i,mypool.get_size()) for i in range(10)];
   # optional test for all tasks complete
   while not all([_.ready() for _ in tasks]) : sleep(0.1);
   # since we've tested for all ready, this loop will not block.
